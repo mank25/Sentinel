@@ -1,12 +1,19 @@
+import asyncio
 import sqlite3
 from pathlib import Path
 
 from mcp.server import MCPServer
 
 
-
 BASE_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = BASE_DIR / "data" / "security.db"
+
+# Structured error returned to the calling agent whenever the security database
+# cannot be read. It deliberately omits filesystem details.
+DB_UNAVAILABLE_ERROR = {
+    "found": False,
+    "error": "Security database is unavailable or invalid",
+}
 
 server = MCPServer(
     name="Sentinel Security Tools",
@@ -14,18 +21,35 @@ server = MCPServer(
 )
 
 
-@server.tool()
-async def get_login_history(username: str) -> dict:
+def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     """
-    Retrieve login history for a user.
+    Open the security database strictly read-only.
 
-    This is a read-only security investigation tool.
+    Using the ``mode=ro`` URI prevents SQLite from creating a missing database
+    file, and ``query_only`` blocks any write attempt on the connection.
     """
 
-    connection = sqlite3.connect(DB_PATH)
+    # ``as_uri`` requires an absolute path and quotes any special characters.
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = 1")
+    return connection
+
+
+def _get_login_history_sync(username: str, db_path: Path = DB_PATH) -> dict:
+    """Blocking SQLite work behind :func:`get_login_history`."""
+
+    db_path = Path(db_path).resolve()
+
+    if not db_path.is_file():
+        return dict(DB_UNAVAILABLE_ERROR)
+
+    connection = None
 
     try:
+        connection = _connect_read_only(db_path)
+
         user = connection.execute(
             """
             SELECT
@@ -69,8 +93,24 @@ async def get_login_history(username: str) -> dict:
             "login_events": [dict(event) for event in events],
         }
 
+    except sqlite3.Error:
+        # Missing, empty, corrupted or unexpectedly-shaped database.
+        return dict(DB_UNAVAILABLE_ERROR)
+
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
+
+
+@server.tool()
+async def get_login_history(username: str) -> dict:
+    """
+    Retrieve login history for a user.
+
+    This is a read-only security investigation tool.
+    """
+
+    return await asyncio.to_thread(_get_login_history_sync, username)
 
 
 async def main():
@@ -78,6 +118,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
