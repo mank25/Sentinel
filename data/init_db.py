@@ -42,6 +42,18 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )
             """)
 
+            connection.execute("""
+            CREATE TABLE IF NOT EXISTS network_events (
+                id INTEGER PRIMARY KEY,
+                ip_address TEXT NOT NULL,
+                reputation TEXT NOT NULL,
+                country TEXT NOT NULL,
+                known INTEGER NOT NULL,
+                connection_count INTEGER NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+            """)
+
             # Demo user
             connection.execute("""
             INSERT OR IGNORE INTO users
@@ -62,6 +74,12 @@ def init_db(db_path: Path = DB_PATH) -> None:
 
             if already_seeded is None:
                 _seed_login_events(connection)
+
+            network_seeded = connection.execute(
+                "SELECT 1 FROM network_events LIMIT 1").fetchone()
+
+            if network_seeded is None:
+                _seed_network_events(connection)
 
     print(f"Database created at: {db_path}")
 
@@ -115,6 +133,21 @@ def _seed_login_events(connection: sqlite3.Connection) -> None:
         "failed"
     ))
 
+def _seed_network_events(connection: sqlite3.Connection) -> None:
+    """Insert demo network intelligence for the suspicious IP."""
+
+    connection.execute("""
+    INSERT INTO network_events
+    (ip_address, reputation, country, known, connection_count, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        "185.123.45.67",
+        "suspicious",
+        "Unknown",
+        0,
+        58,
+        "2026-08-25T02:14:01"
+    ))
 
 if __name__ == "__main__":
     init_db()

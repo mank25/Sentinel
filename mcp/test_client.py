@@ -29,14 +29,23 @@ async def main():
             for tool in tools.tools:
                 print(f"- {tool.name}")
 
-            # Call our security investigation tool
-            result = await session.call_tool(
+            # Call our login investigation tool
+            login_result = await session.call_tool(
                 "get_login_history",
                 {"username": "admin"},
             )
 
-            print("\nTool result:")
-            print(result)
+            print("\nLogin history result:")
+            print(login_result)
+
+            # Call our network investigation tool
+            network_result = await session.call_tool(
+                "get_network_activity",
+                {"ip_address": "185.123.45.67"},
+            )
+
+            print("\nNetwork activity result:")
+            print(network_result)
 
 
 if __name__ == "__main__":

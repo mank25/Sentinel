@@ -36,7 +36,6 @@ def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA query_only = 1")
     return connection
 
-
 def _get_login_history_sync(username: str, db_path: Path = DB_PATH) -> dict:
     """Blocking SQLite work behind :func:`get_login_history`."""
 
@@ -101,7 +100,6 @@ def _get_login_history_sync(username: str, db_path: Path = DB_PATH) -> dict:
         if connection is not None:
             connection.close()
 
-
 @server.tool()
 async def get_login_history(username: str) -> dict:
     """
@@ -112,6 +110,81 @@ async def get_login_history(username: str) -> dict:
 
     return await asyncio.to_thread(_get_login_history_sync, username)
 
+@server.tool()
+async def get_network_activity(ip_address: str) -> dict:
+    """Return network intelligence for an IP address.
+
+    This is a read-only security investigation tool.
+    """
+
+    return await asyncio.to_thread(
+        _get_network_activity_sync,
+        ip_address,
+    )
+
+def _get_network_activity_sync(ip_address: str) -> dict:
+    """Perform the read-only SQLite lookup in a worker thread."""
+
+    if not DB_PATH.exists():
+        return {
+            "found": False,
+            "error": "Security database is unavailable.",
+        }
+
+    connection = None
+
+    try:
+        connection = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+
+        connection.execute("PRAGMA query_only = 1")
+
+        row = connection.execute(
+            """
+            SELECT
+                ip_address,
+                reputation,
+                country,
+                known,
+                connection_count,
+                timestamp
+            FROM network_events
+            WHERE ip_address = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (ip_address,),
+        ).fetchone()
+
+        if row is None:
+            return {
+                "found": False,
+                "ip_address": ip_address,
+            }
+
+        return {
+            "found": True,
+            "ip_address": row["ip_address"],
+            "reputation": row["reputation"],
+            "country": row["country"],
+            "known": bool(row["known"]),
+            "connection_count": row["connection_count"],
+            "timestamp": row["timestamp"],
+        }
+
+    except sqlite3.Error:
+        return {
+            "found": False,
+            "ip_address": ip_address,
+            "error": "Unable to read network security data.",
+        }
+
+    finally:
+        if connection is not None:
+            connection.close()
 
 async def main():
     await server.run_stdio_async()
