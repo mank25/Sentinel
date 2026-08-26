@@ -13,6 +13,7 @@ def calculate_risk(evidence: dict) -> dict:
             "risk_score": 0,
             "threat_level": "UNKNOWN",
             "risk_factors": [],
+            "incomplete_evidence": True,
             "error": evidence.get(
                 "error",
                 "Investigation evidence unavailable",
@@ -64,18 +65,29 @@ def calculate_risk(evidence: dict) -> dict:
     # Successful authentication
     # --------------------------------------------------
 
-    if (
-        failed_logins > 0
-        and evidence.get("successful_logins", 0) > 0
-    ):
+    # Awarded only when the ordered login timeline shows a success that
+    # actually followed failed attempts -- never inferred from counts.
+    if evidence.get("successful_login_after_failures"):
+        detail = evidence.get(
+            "successful_login_after_failures_detail",
+        ) or {}
+
+        preceding = detail.get("preceding_failures")
+        timestamp = detail.get("timestamp")
+
+        reason = "A successful authentication followed failed login attempts."
+
+        if preceding and timestamp:
+            reason = (
+                f"A successful authentication at {timestamp} followed "
+                f"{preceding} failed login attempts."
+            )
+
         score += 20
         factors.append({
             "factor": "Successful login after failures",
             "points": 20,
-            "reason": (
-                "A successful authentication occurred in an account "
-                "with repeated preceding failures."
-            ),
+            "reason": reason,
         })
 
     # --------------------------------------------------
@@ -142,6 +154,36 @@ def calculate_risk(evidence: dict) -> dict:
             })
 
     # --------------------------------------------------
+    # Evidence completeness
+    #
+    # A failed network lookup is missing evidence, not a clean result. It
+    # carries no points -- it is recorded so the report can say the picture
+    # is incomplete.
+    # --------------------------------------------------
+
+    incomplete_evidence = bool(
+        evidence.get("incomplete_network_evidence")
+    )
+
+    if incomplete_evidence:
+        gaps = [
+            error.get("ip_address")
+            for error in evidence.get("network_errors", [])
+        ]
+        gaps += evidence.get("network_unqueried_ips", [])
+
+        listed = ", ".join(str(ip) for ip in gaps if ip) or "one or more IPs"
+
+        factors.append({
+            "factor": "Incomplete network evidence",
+            "points": 0,
+            "reason": (
+                "Network intelligence could not be retrieved for "
+                f"{listed}; this investigation is based on partial evidence."
+            ),
+        })
+
+    # --------------------------------------------------
     # Cap score at 100
     # --------------------------------------------------
 
@@ -164,4 +206,5 @@ def calculate_risk(evidence: dict) -> dict:
         "risk_score": score,
         "threat_level": threat_level,
         "risk_factors": factors,
+        "incomplete_evidence": incomplete_evidence,
     }
