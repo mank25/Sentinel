@@ -116,9 +116,6 @@ export default function App() {
           break;
 
         case "error":
-          // Clear the gate: a dead run must not leave clickable
-          // Approve/Deny buttons behind, which would only earn a 409.
-          setPending([]);
           setError(event.message);
           setStatus("error");
           break;
