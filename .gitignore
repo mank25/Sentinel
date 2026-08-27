@@ -6,3 +6,6 @@ __pycache__/
 data/*.db
 .sentinel-mcp-token
 *.egg-info/
+
+
+ui/web/node_modules

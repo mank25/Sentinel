@@ -27,11 +27,21 @@ DEFAULT_TIMEOUT = 300.0
 
 # The tools the agent is allowed to reach, named explicitly rather than with
 # "@all" so a future tool cannot silently widen the agent's reach.
-SENTINEL_TOOLS = [
+EVIDENCE_TOOLS = [
     "get_login_history",
     "get_network_activity",
     "assess_user_risk",
+    "get_account_status",
 ]
+
+# Containment tools change state. They are annotated destructive on the MCP
+# server, so TrueForge pauses for human approval before either can run.
+CONTAINMENT_TOOLS = [
+    "contain_account",
+    "block_ip",
+]
+
+SENTINEL_TOOLS = EVIDENCE_TOOLS + CONTAINMENT_TOOLS
 
 
 def _env(name: str, default: str) -> str:

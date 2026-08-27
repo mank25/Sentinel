@@ -16,14 +16,26 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from investigator.assessment import assess, summarize  # noqa: E402
+from investigator import containment  # noqa: E402
 
-# Every tool in this server only ever reads. The annotations make that
-# explicit to any MCP client, so hosts can grant read-only tools without
-# human approval.
+# The evidence tools only ever read. The annotations make that explicit to
+# any MCP client, so a host can grant them without human approval.
 READ_ONLY = ToolAnnotations(
     read_only_hint=True,
     destructive_hint=False,
     idempotent_hint=True,
+    open_world_hint=False,
+)
+
+# The containment tools change state and are not undoable by the agent.
+# Annotating them honestly is what makes a host gate them: TrueForge's
+# default `require_approval_for_tools` is ["@write", "@destructive"], so a
+# tool marked this way pauses for a human without any further configuration.
+# Never relax these hints to make a run smoother.
+CONTAINMENT = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=False,
     open_world_hint=False,
 )
 
@@ -231,6 +243,66 @@ async def assess_user_risk(username: str) -> dict:
     """
 
     return await asyncio.to_thread(_assess_user_risk_sync, username)
+
+
+# ---------------------------------------------------------------------
+# Containment -- the only tools in Sentinel that write
+#
+# These reach investigator.containment, which writes to a *separate*
+# database. The evidence store stays read-only. Each of these is annotated
+# destructive so the host stops and asks a human before it runs.
+# ---------------------------------------------------------------------
+
+@server.tool(annotations=CONTAINMENT)
+async def contain_account(username: str, justification: str) -> dict:
+    """Lock an account and revoke its active sessions.
+
+    This is a containment action, not an investigation step. It is disruptive:
+    locking a privileged account can lock a legitimate operator out during an
+    incident, so it requires human approval before it runs.
+
+    Record the reason in ``justification`` -- it is written to the containment
+    audit log alongside the action and must state the evidence that warranted
+    it.
+    """
+
+    return await asyncio.to_thread(
+        containment.record_action,
+        containment.ACTION_CONTAIN_ACCOUNT,
+        username,
+        justification,
+    )
+
+
+@server.tool(annotations=CONTAINMENT)
+async def block_ip(ip_address: str, justification: str) -> dict:
+    """Block an IP address at the network perimeter.
+
+    This is a containment action, not an investigation step. It is disruptive:
+    a single address may be a shared VPN or NAT egress serving unrelated
+    users, so it requires human approval before it runs.
+
+    Record the reason in ``justification`` -- it is written to the containment
+    audit log alongside the action.
+    """
+
+    return await asyncio.to_thread(
+        containment.record_action,
+        containment.ACTION_BLOCK_IP,
+        ip_address,
+        justification,
+    )
+
+
+@server.tool(annotations=READ_ONLY)
+async def get_account_status(username: str) -> dict:
+    """Report whether an account is currently contained, and why.
+
+    Reads the containment audit log so an investigation can see response
+    actions that were already taken. This is a read-only tool.
+    """
+
+    return await asyncio.to_thread(containment.account_status, username)
 
 
 async def main():

@@ -263,10 +263,62 @@ def test_evidence_gaps_section_is_conditional():
     assert "only if" in LOWER
 
 
-def test_agent_is_told_it_is_read_only():
-    assert "read-only" in LOWER
-    assert "cannot change any account" in LOWER
-    assert "recommendations for a human operator" in LOWER
+def test_agent_is_told_evidence_tools_cannot_change_anything():
+    """Read-only is now a property of the evidence tools, not the agent."""
+
+    assert "cannot change anything" in LOWER
+    assert "run only after a" in LOWER and "human approves them" in LOWER
+    assert "recommendation for a human operator" in LOWER
+
+
+# ------------------------------------------------------------------
+# Containment -- proposed by the agent, decided by a human
+# ------------------------------------------------------------------
+
+def test_documents_the_containment_tools():
+    for tool in ["contain_account", "block_ip", "get_account_status"]:
+        assert tool in PROMPT
+
+
+def test_containment_is_separated_from_evidence_gathering():
+    assert "your containment tools" in LOWER
+    assert "everything above only reads" in LOWER
+
+
+def test_states_that_a_human_must_approve_containment():
+    assert "a human must approve every containment call before it" in LOWER
+    assert "proposing an action, not performing one" in LOWER
+
+
+def test_explains_why_containment_is_disruptive():
+    """The agent should understand the cost of being wrong."""
+
+    assert "lock a legitimate operator out" in LOWER
+    assert "shared vpn or nat egress" in LOWER
+
+
+def test_requires_an_evidence_based_justification():
+    assert "justification" in LOWER
+    assert '"suspicious activity" is not a justification' in LOWER
+
+
+def test_containment_is_restricted_to_high_and_critical():
+    assert "only when the threat level is high or critical" in LOWER
+    assert "at medium or low, recommend in" in LOWER
+
+
+def test_containment_targets_must_be_implicated_by_evidence():
+    assert "a target the evidence implicates" in LOWER
+
+
+def test_a_denial_must_be_respected():
+    assert "that decision stands" in LOWER
+    assert "do not retry it or work around it" in LOWER
+
+
+def test_containment_outcome_must_be_reported_honestly():
+    assert "CONTAINMENT" in PROMPT
+    assert "never describe a denied or unapproved action as though it" in LOWER
 
 
 # ------------------------------------------------------------------

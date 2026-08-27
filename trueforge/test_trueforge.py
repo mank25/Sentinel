@@ -13,13 +13,17 @@ from investigator.prompts import SENTINEL_SYSTEM_PROMPT
 from trueforge.agent import (
     SentinelAgent,
     SentinelAgentError,
+    allow_all,
     build_agent_spec,
+    deny_all,
     diagnose_turn_error,
     extract_trace,
+    pending_approvals,
     summarize_tool_calls,
 )
 from trueforge.client import (
     TrueForgeClient,
+    approval_item,
     TrueForgeHTTPError,
     TrueForgeProtocolError,
     TrueForgeTimeout,
@@ -80,6 +84,16 @@ class FakeHTTP:
 
     def close(self):
         pass
+
+
+ALL_TOOLS = [
+    "get_login_history",
+    "get_network_activity",
+    "assess_user_risk",
+    "get_account_status",
+    "contain_account",
+    "block_ip",
+]
 
 
 def _config():
@@ -176,11 +190,7 @@ def test_register_mcp_server_attaches_header_auth():
 def test_provisioning_registers_the_mcp_server_with_a_bearer_token():
     """The HTTP transport must never be registered anonymously."""
 
-    http = FakeHTTP(_provision_routes([
-        "get_login_history",
-        "get_network_activity",
-        "assess_user_risk",
-    ]))
+    http = FakeHTTP(_provision_routes(ALL_TOOLS))
 
     config = _config()
     config.mcp_token = "unit-test-token"
@@ -285,13 +295,7 @@ def test_agent_spec_attaches_sentinel_mcp_tools_only():
     server = spec["mcp_servers"][0]
 
     assert server["name"] == "sentinel-security"
-    assert server["enable_tools"] == [
-        "get_login_history",
-        "get_network_activity",
-        "assess_user_risk",
-    ]
-    # Read-only tools never need human approval.
-    assert server["require_approval_for_tools"] == []
+    assert server["enable_tools"] == ALL_TOOLS
 
 
 def test_agent_spec_does_not_leak_scoring_into_the_prompt():
@@ -383,19 +387,11 @@ def _provision_routes(tools):
 
 
 def test_ensure_mcp_server_returns_discovered_tools():
-    http = FakeHTTP(_provision_routes([
-        "get_login_history",
-        "get_network_activity",
-        "assess_user_risk",
-    ]))
+    http = FakeHTTP(_provision_routes(ALL_TOOLS))
 
     agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
 
-    assert agent.ensure_mcp_server() == [
-        "get_login_history",
-        "get_network_activity",
-        "assess_user_risk",
-    ]
+    assert agent.ensure_mcp_server() == ALL_TOOLS
 
 
 def test_ensure_mcp_server_reports_missing_tools():
@@ -677,11 +673,7 @@ def test_summarize_tool_calls_lists_tools_in_order():
 # ------------------------------------------------------------------
 
 def _investigation_routes(turn_state, events=None):
-    routes = _provision_routes([
-        "get_login_history",
-        "get_network_activity",
-        "assess_user_risk",
-    ])
+    routes = _provision_routes(ALL_TOOLS)
 
     routes.update({
         "POST /sessions": _ok({"data": {"id": "sess-1"}}),
@@ -756,20 +748,245 @@ def test_failed_turn_surfaces_the_error_and_keeps_the_trace():
     ]
 
 
-def test_paused_turn_reports_required_actions():
-    state = {
-        "status": "done",
-        "output": None,
-        "required_actions": [{"type": "tool.approval_required"}],
-        "completed_at": "t6",
-    }
+# ------------------------------------------------------------------
+# Containment approval gate
+# ------------------------------------------------------------------
 
-    http = FakeHTTP(_investigation_routes(state))
+CONTAINMENT_EVENTS = [
+    {
+        "type": "model.message",
+        "created_at": "t1",
+        "tool_calls": [
+            {
+                "id": "call-c1",
+                "function": {
+                    "name": "contain_account",
+                    "arguments": '{"username": "admin", '
+                                 '"justification": "brute force"}',
+                },
+            }
+        ],
+    },
+    {
+        "type": "tool.approval_required",
+        "created_at": "t2",
+        "thread_id": "main",
+        "tool_calls": [{"id": "call-c1", "source_event_id": "e1"}],
+    },
+]
+
+PAUSED_STATE = {
+    "status": "done",
+    "output": None,
+    "required_actions": [
+        {
+            "type": "tool.approval_required",
+            "thread_id": "main",
+            "tool_calls": [{"id": "call-c1", "source_event_id": "e1"}],
+        }
+    ],
+    "completed_at": "t3",
+}
+
+
+def test_paused_turn_reports_what_approval_is_needed():
+    """Without a decision callback the run stops -- never auto-approves."""
+
+    http = FakeHTTP(_investigation_routes(PAUSED_STATE, CONTAINMENT_EVENTS))
     agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
 
     result = agent.investigate("admin")
 
-    assert "tool.approval_required" in result["error"]
+    pending = result["pending_approvals"]
+
+    assert len(pending) == 1
+    assert pending[0]["tool"] == "contain_account"
+    assert pending[0]["arguments"]["username"] == "admin"
+    assert pending[0]["arguments"]["justification"] == "brute force"
+    assert "contain_account" in result["error"]
+    # Nothing was decided, so nothing was recorded as approved.
+    assert result["approvals"] == []
+
+
+def test_pending_approvals_joins_ids_to_their_arguments():
+    turn = {"state": PAUSED_STATE}
+    trace = extract_trace(CONTAINMENT_EVENTS)
+
+    pending = pending_approvals(turn, trace)
+
+    assert pending == [{
+        "thread_id": "main",
+        "tool_call_id": "call-c1",
+        "tool": "contain_account",
+        "arguments": {"username": "admin", "justification": "brute force"},
+    }]
+
+
+def test_approval_required_appears_in_the_trace():
+    steps = [e["step"] for e in extract_trace(CONTAINMENT_EVENTS)]
+
+    assert "tool.approval_required" in steps
+
+
+def _approval_flow_routes(second_state, second_events):
+    """Turn 1 pauses for approval; turn 2 is the resumed turn."""
+
+    routes = _provision_routes(ALL_TOOLS)
+    routes.update({
+        "POST /sessions": _ok({"data": {"id": "sess-1"}}),
+        "POST /sessions/sess-1/turns": [
+            _ok({"data": {"id": "turn-1"}}),
+            _ok({"data": {"id": "turn-2"}}),
+        ],
+        "GET /sessions/sess-1/turns/turn-1": _ok({
+            "data": {"id": "turn-1", "state": PAUSED_STATE}
+        }),
+        "GET /sessions/sess-1/turns/turn-1/events": _ok({
+            "data": CONTAINMENT_EVENTS,
+            "pagination": {"limit": 100},
+        }),
+        "GET /sessions/sess-1/turns/turn-2": _ok({
+            "data": {"id": "turn-2", "state": second_state}
+        }),
+        "GET /sessions/sess-1/turns/turn-2/events": _ok({
+            "data": second_events,
+            "pagination": {"limit": 100},
+        }),
+    })
+
+    return routes
+
+
+RESUMED_DONE = {
+    "status": "done",
+    "output": {"content": "Containment applied."},
+    "required_actions": [],
+    "completed_at": "t9",
+}
+
+RESUMED_EVENTS = [
+    {
+        "type": "tool.response",
+        "created_at": "t4",
+        "tool_call_id": "call-c1",
+        "content": '{"ok": true, "action_id": 1}',
+    },
+    {"type": "model.message", "created_at": "t5",
+     "content": "Containment applied."},
+    {"type": "turn.done", "created_at": "t6", "state": RESUMED_DONE},
+]
+
+
+def test_allowing_containment_resumes_the_turn():
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin", on_approval=allow_all)
+
+    assert result["status"] == "done"
+    assert result["pending_approvals"] == []
+    assert not result.get("error")
+    assert result["approvals"] == [{
+        "tool": "contain_account",
+        "arguments": {"username": "admin", "justification": "brute force"},
+        "tool_call_id": "call-c1",
+        "allowed": True,
+        "reason": None,
+    }]
+    assert result["response"] == "Containment applied."
+
+
+def test_allow_sends_a_user_tool_approval_item():
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    agent.investigate("admin", on_approval=allow_all)
+
+    resume = [
+        req for req in http.requests
+        if req["method"] == "POST"
+        and req["url"].endswith("/sessions/sess-1/turns")
+    ][1]
+
+    assert resume["json"]["input"] == [{
+        "type": "user.tool_approval",
+        "thread_id": "main",
+        "tool_call_id": "call-c1",
+        "approval": {"status": "allow"},
+    }]
+    assert resume["json"]["previous_turn_id"] == "turn-1"
+
+
+def test_denying_containment_is_recorded_and_reported():
+    denied_done = {
+        "status": "done",
+        "output": {"content": "Containment was declined; no action taken."},
+        "required_actions": [],
+        "completed_at": "t9",
+    }
+
+    http = FakeHTTP(_approval_flow_routes(denied_done, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin", on_approval=deny_all)
+
+    assert result["status"] == "done"
+    assert result["approvals"][0]["allowed"] is False
+    assert result["approvals"][0]["reason"] == "Denied by operator."
+
+
+def test_deny_sends_a_reason_to_the_agent():
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    agent.investigate("admin", on_approval=deny_all)
+
+    resume = [
+        req for req in http.requests
+        if req["method"] == "POST"
+        and req["url"].endswith("/sessions/sess-1/turns")
+    ][1]
+
+    approval = resume["json"]["input"][0]["approval"]
+
+    assert approval["status"] == "deny"
+    assert approval["reason"] == "Denied by operator."
+
+
+def test_allow_decision_carries_no_reason_field():
+    """TrueForge's ApprovalAllow schema has no reason property."""
+
+    item = approval_item("main", "call-1", True, "should be dropped")
+
+    assert item["approval"] == {"status": "allow"}
+
+
+def test_approval_loop_is_bounded():
+    """A server that keeps re-pausing must not loop forever."""
+
+    routes = _provision_routes(ALL_TOOLS)
+    routes.update({
+        "POST /sessions": _ok({"data": {"id": "sess-1"}}),
+        "POST /sessions/sess-1/turns": lambda req: _ok(
+            {"data": {"id": "turn-1"}}
+        ),
+        "GET /sessions/sess-1/turns/turn-1": lambda req: _ok(
+            {"data": {"id": "turn-1", "state": PAUSED_STATE}}
+        ),
+        "GET /sessions/sess-1/turns/turn-1/events": lambda req: _ok({
+            "data": CONTAINMENT_EVENTS,
+            "pagination": {"limit": 100},
+        }),
+    })
+
+    http = FakeHTTP(routes)
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate(
+        "admin", on_approval=allow_all, max_approval_rounds=2
+    )
+
+    assert len(result["approvals"]) == 2
 
 
 def test_investigation_reports_unreachable_trueforge():
@@ -778,3 +995,153 @@ def test_investigation_reports_unreachable_trueforge():
 
     with pytest.raises(TrueForgeUnavailable):
         agent.investigate("admin")
+
+
+# ------------------------------------------------------------------
+# CLI approval rendering and decisions
+# ------------------------------------------------------------------
+
+from trueforge import run_agent  # noqa: E402
+
+PENDING_ITEM = {
+    "thread_id": "main",
+    "tool_call_id": "call-c1",
+    "tool": "contain_account",
+    "arguments": {
+        "username": "admin",
+        "justification": "47 failed logins from 185.123.45.67",
+    },
+}
+
+
+def test_describe_request_shows_action_target_and_reason():
+    rendered = run_agent.describe_request(PENDING_ITEM)
+
+    assert "CONTAINMENT APPROVAL REQUIRED" in rendered
+    assert "contain_account" in rendered
+    assert "admin" in rendered
+    assert "47 failed logins" in rendered
+
+
+def test_describe_request_separates_justification_from_target():
+    """The reason is the case being made, not part of the target."""
+
+    rendered = run_agent.describe_request(PENDING_ITEM)
+    target_line = next(
+        line for line in rendered.splitlines() if "target:" in line
+    )
+
+    assert "justification" not in target_line
+
+
+def test_prompt_approves_on_yes(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+    decisions = run_agent.prompt_for_approval([PENDING_ITEM], "no")
+
+    assert decisions[0]["approval"] == {"status": "allow"}
+
+
+def test_prompt_denies_on_no(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *_: "n")
+
+    decisions = run_agent.prompt_for_approval([PENDING_ITEM], "too risky")
+
+    assert decisions[0]["approval"]["status"] == "deny"
+    assert decisions[0]["approval"]["reason"] == "too risky"
+
+
+def test_empty_answer_defaults_to_deny(monkeypatch):
+    """Silence is not consent."""
+
+    monkeypatch.setattr("builtins.input", lambda *_: "")
+
+    decisions = run_agent.prompt_for_approval([PENDING_ITEM], "no")
+
+    assert decisions[0]["approval"]["status"] == "deny"
+
+
+def test_non_interactive_stdin_denies(monkeypatch):
+    """A closed stdin must never be read as approval."""
+
+    def raise_eof(*_):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    decisions = run_agent.prompt_for_approval([PENDING_ITEM], "no")
+
+    assert decisions[0]["approval"]["status"] == "deny"
+
+
+def test_approve_and_deny_flags_are_mutually_exclusive():
+    parser = run_agent.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--approve", "--deny"])
+
+
+def test_no_approval_flag_means_interactive():
+    args = run_agent.build_parser().parse_args([])
+
+    assert args.approve is False
+    assert args.deny is False
+
+
+# ---------------------------------------------------------------------
+# Regressions for the Qodo review on PR #5
+# ---------------------------------------------------------------------
+
+def test_resumed_response_still_pairs_with_its_call():
+    """Qodo #2: a tool.response in the resumed turn belongs to a
+    tool.call recorded before the pause.
+
+    Extracting each turn separately left the response with tool=None,
+    breaking the documented call/response pairing in --trace and in the
+    console, which renders the same trace.
+    """
+
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin", on_approval=allow_all)
+
+    responses = [
+        entry for entry in result["trace"]
+        if entry.get("step") == "tool.response"
+        and entry.get("tool_call_id") == "call-c1"
+    ]
+
+    assert responses, "the resumed tool.response is missing from the trace"
+
+    for response in responses:
+        assert response.get("tool") == "contain_account", (
+            "the resumed response lost its tool name"
+        )
+
+
+def test_raw_events_span_every_turn():
+    """Qodo #3: --json advertises the full raw history.
+
+    events was overwritten on each resume, so the original tool request
+    and the approval-required event vanished from the JSON output.
+    """
+
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin", on_approval=allow_all)
+    events = result["events"]
+
+    assert len(events) >= len(CONTAINMENT_EVENTS) + len(RESUMED_EVENTS), (
+        "events lost the turns before the resume"
+    )
+
+    types = [event.get("type") for event in events]
+
+    assert "tool.response" in types
+    assert any(
+        event.get("type") == "model.message"
+        and "Containment applied." in str(event.get("content", ""))
+        for event in events
+    ), "the resumed turn's events are missing"
