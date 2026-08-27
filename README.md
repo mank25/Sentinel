@@ -207,6 +207,56 @@ working local default.
 8. `GET /api/v1/sessions/{id}/turns/{turn_id}/events` - collect the real
    execution trace
 
+### Containment and the approval gate
+
+Sentinel's evidence tools only read. Containment is the one write path, and
+it is gated on a human.
+
+Two stores, one direction each:
+
+| Store | Opened | Written by |
+|---|---|---|
+| `data/security.db` | `mode=ro` + `PRAGMA query_only` | nothing, ever |
+| `data/containment.db` | read-write | `investigator/containment.py` only |
+
+An investigation can therefore never modify the evidence it reasons about.
+
+**The gate is enforced by the harness, not the prompt.** `contain_account`
+and `block_ip` are annotated `readOnlyHint: false, destructiveHint: true` on
+the MCP server, and the agent spec sets
+`require_approval_for_tools: ["@write", "@destructive"]`. TrueForge pauses the
+turn and emits `tool.approval_required`; nothing runs until a
+`user.tool_approval` decision comes back. Rewriting the system prompt cannot
+bypass this — the model proposes, a person decides.
+
+Containment writes are observable: `get_account_status` reads the audit log
+back, so a later investigation sees that a response action was taken and why.
+
+Running it:
+
+```bash
+python -m trueforge.run_agent --username admin --trace   # prompts you to decide
+python -m trueforge.run_agent --username admin --approve # scripted demo: approve
+python -m trueforge.run_agent --username admin --deny    # scripted demo: deny
+```
+
+Interactively the run stops and shows what is being requested:
+
+```
+====================================================================
+  CONTAINMENT APPROVAL REQUIRED
+====================================================================
+  action:  contain_account
+  target:  username='admin'
+  reason:  47 failed logins then a success from 185.123.45.67
+====================================================================
+  Approve this action? [y/N]
+```
+
+An empty answer, or a closed stdin, is a **denial** — silence is never
+consent. On denial the decision is final: the agent reports that the action
+was not taken and may not retry it.
+
 ### The investigator prompt
 
 `investigator/prompts.py` is the agent's behaviour specification, and it is

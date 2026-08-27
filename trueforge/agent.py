@@ -21,7 +21,11 @@ from investigator.prompts import (
     SENTINEL_SYSTEM_PROMPT,
     investigation_request,
 )
-from trueforge.client import TrueForgeClient, TrueForgeError
+from trueforge.client import (
+    TrueForgeClient,
+    TrueForgeError,
+    approval_item,
+)
 from trueforge.config import TrueForgeConfig
 from trueforge.mcp_auth import authorization_header
 
@@ -91,7 +95,13 @@ def build_agent_spec(config: TrueForgeConfig) -> dict:
                 # Named explicitly rather than "@all" so a new tool on the
                 # server cannot silently widen the agent's reach.
                 "enable_tools": list(config.tools),
-                "require_approval_for_tools": [],
+                # TrueForge's own default, stated explicitly so it cannot be
+                # lost in a refactor. The evidence tools are annotated
+                # read-only and run freely; contain_account and block_ip are
+                # annotated destructive and therefore pause for a human.
+                # The gate is enforced by the harness, not by the prompt --
+                # rewriting the instructions cannot bypass it.
+                "require_approval_for_tools": ["@write", "@destructive"],
                 "preload": True,
             }
         ],
@@ -191,6 +201,14 @@ def extract_trace(events: list) -> list:
                 "created_at": event.get("created_at"),
             })
 
+        elif kind == "tool.approval_required":
+            for call in event.get("tool_calls") or []:
+                trace.append({
+                    "step": "tool.approval_required",
+                    "tool_call_id": call.get("id"),
+                    "created_at": event.get("created_at"),
+                })
+
         elif kind == "turn.done":
             state = event.get("state", {})
 
@@ -234,6 +252,63 @@ def summarize_tool_calls(trace: list) -> list:
         entry["tool"]
         for entry in trace
         if entry.get("step") == "tool.call" and entry.get("tool")
+    ]
+
+
+def pending_approvals(turn: dict, trace: list) -> list:
+    """The containment calls a turn is paused on, with their arguments.
+
+    ``required_actions`` names the tool-call ids; the arguments live on the
+    ``model.message`` that requested them, which the trace already carries.
+    Joining the two gives a human enough to decide on.
+    """
+
+    state = turn.get("state", {})
+    calls_by_id = {
+        entry.get("tool_call_id"): entry
+        for entry in trace
+        if entry.get("step") == "tool.call"
+    }
+
+    pending = []
+
+    for action in state.get("required_actions") or []:
+        if action.get("type") != "tool.approval_required":
+            continue
+
+        thread_id = action.get("thread_id", "main")
+
+        for call in action.get("tool_calls") or []:
+            call_id = call.get("id")
+            requested = calls_by_id.get(call_id, {})
+
+            pending.append({
+                "thread_id": thread_id,
+                "tool_call_id": call_id,
+                "tool": requested.get("tool"),
+                "arguments": requested.get("arguments", {}),
+            })
+
+    return pending
+
+
+def deny_all(pending: list, reason: str = "Denied by operator.") -> list:
+    """A decision callback that refuses every containment request."""
+
+    return [
+        approval_item(
+            item["thread_id"], item["tool_call_id"], False, reason
+        )
+        for item in pending
+    ]
+
+
+def allow_all(pending: list) -> list:
+    """A decision callback that approves every containment request."""
+
+    return [
+        approval_item(item["thread_id"], item["tool_call_id"], True)
+        for item in pending
     ]
 
 
@@ -378,8 +453,21 @@ class SentinelAgent:
     # Execution
     # -----------------------------------------------------------------
 
-    def investigate(self, username: str, provision: bool = True) -> dict:
-        """Run one investigation and return the response plus its trace."""
+    def investigate(
+        self,
+        username: str,
+        provision: bool = True,
+        on_approval=None,
+        max_approval_rounds: int = 4,
+    ) -> dict:
+        """Run one investigation and return the response plus its trace.
+
+        If the agent proposes a containment action, TrueForge pauses the turn
+        and ``on_approval`` is called with the pending calls. It must return
+        ``user.tool_approval`` items (see :func:`allow_all` / :func:`deny_all`
+        / :func:`approval_item`). With no callback the run stops at the pause
+        and reports what was requested -- nothing is ever auto-approved.
+        """
 
         if provision:
             self.provision()
@@ -408,14 +496,65 @@ class SentinelAgent:
             ) from exc
 
         turn_id = turn["id"]
-
         turn = self.client.wait_for_turn(session_id, turn_id)
-
-        state = turn.get("state", {})
-        status = state.get("status")
 
         events = self.client.list_turn_events(session_id, turn_id)
         trace = extract_trace(events)
+        approvals = []
+
+        # ------------------------------------------------------------
+        # Containment approval loop
+        # ------------------------------------------------------------
+        rounds = 0
+
+        while True:
+            pending = pending_approvals(turn, trace)
+
+            if not pending or on_approval is None:
+                break
+
+            if rounds >= max_approval_rounds:
+                break
+
+            rounds += 1
+
+            decisions = on_approval(pending)
+
+            if not decisions:
+                break
+
+            for item, decision in zip(pending, decisions):
+                approvals.append({
+                    "tool": item["tool"],
+                    "arguments": item["arguments"],
+                    "tool_call_id": item["tool_call_id"],
+                    "allowed": (
+                        decision.get("approval", {}).get("status") == "allow"
+                    ),
+                    "reason": decision.get("approval", {}).get("reason"),
+                })
+
+            try:
+                turn = self.client.resume_turn_with_approval(
+                    session_id,
+                    decisions,
+                    previous_turn_id=turn_id,
+                )
+
+            except TrueForgeError as exc:
+                raise SentinelAgentError(
+                    f"Could not resume session {session_id} after a "
+                    f"containment decision: {exc}"
+                ) from exc
+
+            turn_id = turn["id"]
+            turn = self.client.wait_for_turn(session_id, turn_id)
+
+            events = self.client.list_turn_events(session_id, turn_id)
+            trace = trace + extract_trace(events)
+
+        state = turn.get("state", {})
+        status = state.get("status")
 
         result = {
             "username": username,
@@ -424,6 +563,8 @@ class SentinelAgent:
             "status": status,
             "response": "",
             "tool_calls": summarize_tool_calls(trace),
+            "approvals": approvals,
+            "pending_approvals": pending_approvals(turn, trace),
             "trace": trace,
             "events": events,
         }
@@ -438,14 +579,15 @@ class SentinelAgent:
             result["error"] = "Turn was cancelled"
             return result
 
-        required = state.get("required_actions") or []
-
-        if required:
+        if result["pending_approvals"]:
+            requested = [
+                item["tool"] for item in result["pending_approvals"]
+            ]
             result["error"] = (
-                "Turn paused awaiting "
-                f"{[action.get('type') for action in required]}"
+                f"Turn is paused awaiting human approval for {requested}. "
+                "Supply an on_approval callback (or use --approve/--deny) "
+                "to decide."
             )
-            result["required_actions"] = required
 
         result["response"] = _message_text(state.get("output"))
 

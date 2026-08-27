@@ -16,6 +16,31 @@ import httpx2
 from trueforge.config import TrueForgeConfig
 
 
+def approval_item(
+    thread_id: str,
+    tool_call_id: str,
+    allow: bool,
+    reason: str | None = None,
+) -> dict:
+    """Build one ``user.tool_approval`` turn-input item.
+
+    ``reason`` is only carried on a denial -- TrueForge's ``ApprovalAllow``
+    schema takes no reason, while ``ApprovalDeny`` shows one to the agent.
+    """
+
+    decision = {"status": "allow" if allow else "deny"}
+
+    if reason and not allow:
+        decision["reason"] = reason
+
+    return {
+        "type": "user.tool_approval",
+        "thread_id": thread_id,
+        "tool_call_id": tool_call_id,
+        "approval": decision,
+    }
+
+
 class TrueForgeError(Exception):
     """Base class for every TrueForge integration failure."""
 
@@ -284,6 +309,35 @@ class TrueForgeClient:
                 json=payload,
             ),
             "create_turn",
+        )
+
+    def resume_turn_with_approval(
+        self,
+        session_id: str,
+        decisions: list,
+        previous_turn_id: str,
+        stream: bool = False,
+    ) -> dict:
+        """Resume a turn paused on ``tool.approval_required``.
+
+        ``decisions`` are ``user.tool_approval`` items -- see
+        :func:`approval_item`. TrueForge forbids mixing approval items with
+        user messages in one turn, so this sends only decisions.
+        """
+
+        payload = {
+            "input": list(decisions),
+            "previous_turn_id": previous_turn_id,
+            "stream": stream,
+        }
+
+        return self._data(
+            self._request(
+                "POST",
+                f"/sessions/{session_id}/turns",
+                json=payload,
+            ),
+            "resume_turn_with_approval",
         )
 
     def get_turn(self, session_id: str, turn_id: str) -> dict:

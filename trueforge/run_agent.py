@@ -13,7 +13,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from trueforge.agent import SentinelAgent  # noqa: E402
+from trueforge.agent import (  # noqa: E402
+    SentinelAgent,
+    allow_all,
+    deny_all,
+)
+from trueforge.client import approval_item  # noqa: E402
 from trueforge.client import TrueForgeError  # noqa: E402
 from trueforge.config import TrueForgeConfig  # noqa: E402
 
@@ -45,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         help="Model FQN as reported by GET /api/v1/models "
-             "(default: $TRUEFORGE_MODEL or groq/gpt-oss-120b).",
+             "(default: $TRUEFORGE_MODEL, else the configured default).",
     )
     parser.add_argument(
         "--base-url",
@@ -61,6 +66,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         help="Seconds to wait for the investigation turn.",
+    )
+
+    approval = parser.add_mutually_exclusive_group()
+    approval.add_argument(
+        "--approve",
+        action="store_true",
+        help="Approve every containment request without prompting. For "
+             "scripted demos only -- it removes the human from the loop.",
+    )
+    approval.add_argument(
+        "--deny",
+        action="store_true",
+        help="Deny every containment request without prompting.",
+    )
+    parser.add_argument(
+        "--deny-reason",
+        default="Denied by operator.",
+        help="Reason shown to the agent when a request is denied.",
     )
 
     return parser
@@ -92,10 +115,75 @@ def _format_trace(trace: list) -> str:
             preview = content[:160] + ("..." if len(content) > 160 else "")
             lines.append(f"  [model] {preview}")
 
+        elif step == "tool.approval_required":
+            lines.append("  [!] paused for human approval")
+
         elif step == "turn.done":
             lines.append(f"  [turn] {entry.get('status')}")
 
     return "\n".join(lines)
+
+
+def describe_request(item: dict) -> str:
+    """Render one pending containment request for a human to judge."""
+
+    arguments = dict(item.get("arguments") or {})
+    justification = arguments.pop("justification", None)
+
+    target = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
+
+    lines = [
+        "",
+        "=" * 68,
+        "  CONTAINMENT APPROVAL REQUIRED",
+        "=" * 68,
+        f"  action:  {item.get('tool')}",
+        f"  target:  {target or '(none)'}",
+    ]
+
+    if justification:
+        lines.append(f"  reason:  {justification}")
+
+    lines.append("=" * 68)
+
+    return "\n".join(lines)
+
+
+def prompt_for_approval(pending: list, deny_reason: str) -> list:
+    """Ask the operator to decide on each pending containment call."""
+
+    decisions = []
+
+    for item in pending:
+        print(describe_request(item))
+
+        answer = ""
+
+        while answer not in {"y", "yes", "n", "no"}:
+            try:
+                answer = input("  Approve this action? [y/N] ").strip().lower()
+
+            except EOFError:
+                # Non-interactive stdin: refuse rather than assume consent.
+                answer = "n"
+
+            if answer == "":
+                answer = "n"
+
+        allow = answer in {"y", "yes"}
+
+        print(f"  -> {'APPROVED' if allow else 'DENIED'}\n")
+
+        decisions.append(
+            approval_item(
+                item["thread_id"],
+                item["tool_call_id"],
+                allow,
+                None if allow else deny_reason,
+            )
+        )
+
+    return decisions
 
 
 def main(argv=None) -> int:
@@ -123,7 +211,21 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
 
-            result = agent.investigate(args.username)
+            if args.approve:
+                on_approval = allow_all
+
+            elif args.deny:
+                def on_approval(pending):
+                    return deny_all(pending, args.deny_reason)
+
+            else:
+                def on_approval(pending):
+                    return prompt_for_approval(pending, args.deny_reason)
+
+            result = agent.investigate(
+                args.username,
+                on_approval=on_approval,
+            )
 
     except TrueForgeError as exc:
         print(f"\nInvestigation failed: {exc}", file=sys.stderr)
@@ -136,6 +238,10 @@ def main(argv=None) -> int:
     print(f"\n=== TRUEFORGE SESSION {result['session_id']} ===")
     print(f"turn: {result['turn_id']}  status: {result['status']}")
     print(f"tool calls: {result['tool_calls']}")
+
+    for decision in result.get("approvals", []):
+        verdict = "APPROVED" if decision["allowed"] else "DENIED"
+        print(f"containment: {decision['tool']} -> {verdict}")
 
     if args.trace:
         print("\n=== EXECUTION TRACE ===")
