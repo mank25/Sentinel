@@ -72,9 +72,14 @@ def build_agent_spec(config: TrueForgeConfig) -> dict:
     """The TrueForge ``AgentSpec`` for the Sentinel investigator.
 
     Every Sentinel tool is read-only and annotated as such, so none of them
-    require human approval. Sub-agents and generative UI are off to keep the
-    execution trace linear and the context small -- the configured model has
-    an 8192-token window.
+    require human approval. Sub-agents and generative UI are off so that the
+    execution trace stays a single linear investigation -- the tool calls are
+    the demonstrable part of the run, and a sub-agent would hide them in a
+    separate thread.
+
+    ``iteration_limit`` doubles as a cost ceiling: a normal investigation
+    uses four or five model calls, and this caps a runaway loop well before
+    it becomes expensive.
     """
 
     return {
