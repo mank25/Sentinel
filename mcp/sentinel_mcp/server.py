@@ -1,12 +1,31 @@
 import asyncio
 import sqlite3
+import sys
 from pathlib import Path
 
 from mcp.server import MCPServer
-
+from mcp.types import ToolAnnotations
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = BASE_DIR / "data" / "security.db"
+
+# Running this file directly puts ``mcp/sentinel_mcp/`` on sys.path, so the
+# deterministic ``investigator`` package would not be importable. Put the
+# project root back before importing from it.
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from investigator.assessment import assess, summarize  # noqa: E402
+
+# Every tool in this server only ever reads. The annotations make that
+# explicit to any MCP client, so hosts can grant read-only tools without
+# human approval.
+READ_ONLY = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
 
 # Structured error returned to the calling agent whenever the security database
 # cannot be read. It deliberately omits filesystem details.
@@ -100,7 +119,7 @@ def _get_login_history_sync(username: str, db_path: Path = DB_PATH) -> dict:
         if connection is not None:
             connection.close()
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
 async def get_login_history(username: str) -> dict:
     """
     Retrieve login history for a user.
@@ -110,7 +129,7 @@ async def get_login_history(username: str) -> dict:
 
     return await asyncio.to_thread(_get_login_history_sync, username)
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
 async def get_network_activity(ip_address: str) -> dict:
     """Return network intelligence for an IP address.
 
@@ -185,6 +204,34 @@ def _get_network_activity_sync(ip_address: str) -> dict:
     finally:
         if connection is not None:
             connection.close()
+
+def _assess_user_risk_sync(username: str) -> dict:
+    """Run the deterministic pipeline end-to-end inside this process."""
+
+    login_data = _get_login_history_sync(username)
+
+    investigation = assess(login_data, _get_network_activity_sync)
+
+    return summarize(investigation)
+
+
+@server.tool(annotations=READ_ONLY)
+async def assess_user_risk(username: str) -> dict:
+    """Run Sentinel's deterministic risk assessment for a user.
+
+    This is the authoritative scoring path. It re-reads the login history,
+    looks up every suspicious IP, correlates the evidence and returns the
+    computed threat level, risk score and the risk factors that justify it.
+
+    The score is produced by Sentinel's deterministic risk engine, not by a
+    language model. Always use the numbers this tool returns verbatim and
+    never estimate a score independently.
+
+    This is a read-only security investigation tool.
+    """
+
+    return await asyncio.to_thread(_assess_user_risk_sync, username)
+
 
 async def main():
     await server.run_stdio_async()

@@ -1,0 +1,29 @@
+[project]
+name = "sentinel"
+version = "0.1.0"
+description = "AI security investigator: read-only MCP tools, a deterministic risk engine, and a TrueForge agent."
+requires-python = ">=3.11"
+
+dependencies = [
+    # MCP server + stdio/streamable-HTTP transports and the client used by
+    # the investigation runner. Brings uvicorn/starlette for the HTTP server.
+    "mcp==2.1.0",
+    # HTTP client for the TrueForge REST API. Ships as an mcp dependency but
+    # trueforge/client.py imports it directly, so declare it explicitly.
+    "httpx2>=2.12,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["investigator", "trueforge"]
+# Integration tests need a live TrueForge + Sentinel MCP server, so they are
+# excluded from a plain `pytest -q` run. Opt in with:
+#     pytest -m integration
+addopts = "-m 'not integration'"
+markers = [
+    "integration: requires a running TrueForge server and Sentinel MCP server",
+]
