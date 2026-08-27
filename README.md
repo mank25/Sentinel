@@ -207,6 +207,41 @@ working local default.
 8. `GET /api/v1/sessions/{id}/turns/{turn_id}/events` - collect the real
    execution trace
 
+### The investigator prompt
+
+`investigator/prompts.py` is the agent's behaviour specification, and it is
+tested like one (`investigator/test_prompts.py`). It is what makes the agent
+an investigator rather than a wrapper around one function.
+
+It contains, deliberately:
+
+- **A role and a standard.** Sentinel is a SOC analyst whose credibility
+  rests on every claim tracing back to a tool result.
+- **Purpose, not just names, for each tool** — why `get_login_history` is
+  always first (it establishes the *baseline* device and location everything
+  else is judged against), why `get_network_activity` exists (to corroborate
+  or *refute* a suspicion the login history alone cannot settle), and that
+  `assess_user_risk` is the scoring system of record.
+- **A method with an explicit correlation stage.** Findings must be tied
+  together across tools before any conclusion; a finding backed by two
+  independent sources is called out as stronger than one backed by a single
+  source. A reconcile step requires the agent to state any disagreement
+  between its own reading and the engine's factors.
+- **Derivation, not memorisation.** Suspicious IPs must come from the login
+  evidence just read. The prompt contains no IP address at all — a test
+  enforces that, because a literal IP would let the agent "investigate" the
+  seeded scenario without reading anything.
+- **Calibration.** Each threat level licenses a specific strength of claim.
+  Only CRITICAL may centre on likely compromise, and even there the wording
+  is "consistent with", never "the account was compromised". HIGH and MEDIUM
+  explicitly may not assert compromise; LOW with no factors must not
+  manufacture concern.
+
+It deliberately contains **no scoring rules**. Two tests enforce that: one
+bans point values and `score +=`-style text, another matches
+threshold-shaped constructs (`score >= 80`, `critical: 80`) so the model can
+never derive a score itself. The engine scores; the agent investigates.
+
 ### Execution trace
 
 `--trace` prints the investigation journey, built from the events TrueForge

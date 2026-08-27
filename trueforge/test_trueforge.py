@@ -295,13 +295,48 @@ def test_agent_spec_attaches_sentinel_mcp_tools_only():
 
 
 def test_agent_spec_does_not_leak_scoring_into_the_prompt():
-    """Risk points must live in investigator/risk.py, not the prompt."""
+    """Risk points must live in investigator/risk.py, not the prompt.
+
+    investigator/test_prompts.py covers the prompt's content in depth; this
+    guards the wiring, i.e. that the spec ships that prompt.
+    """
 
     instructions = build_agent_spec(_config())["instructions"]
 
     assert "assess_user_risk" in instructions
     for banned in ["+30", "+25", "score += ", "30 points"]:
         assert banned not in instructions
+
+
+def test_agent_spec_keeps_the_execution_trace_linear():
+    """Sub-agents would move tool calls into a thread the trace hides.
+
+    TrueForge's visible tool execution is the demonstrable part of a run, so
+    the spec must not enable anything that relocates it.
+    """
+
+    config = build_agent_spec(_config())["config"]
+
+    assert config["dynamic_sub_agents"]["enabled"] is False
+    assert config["generative_ui"]["enabled"] is False
+    # Non-interactive runs must never block waiting on a human.
+    assert config["ask_user_questions"]["enabled"] is False
+
+
+def test_agent_spec_caps_the_agent_loop():
+    """iteration_limit is both a runaway guard and a cost ceiling."""
+
+    config = build_agent_spec(_config())["config"]
+
+    assert 1 <= config["iteration_limit"] <= 32
+
+
+def test_agent_spec_preloads_the_tool_schemas():
+    """Deferred discovery spends a model call on list_tools before any work."""
+
+    server = build_agent_spec(_config())["mcp_servers"][0]
+
+    assert server["preload"] is True
 
 
 def test_upsert_agent_creates_when_absent():
