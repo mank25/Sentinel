@@ -23,6 +23,7 @@ from investigator.prompts import (
 )
 from trueforge.client import TrueForgeClient, TrueForgeError
 from trueforge.config import TrueForgeConfig
+from trueforge.mcp_auth import authorization_header
 
 MCP_SERVER_DESCRIPTION = (
     "Read-only Sentinel security investigation tools: login history, "
@@ -273,6 +274,9 @@ class SentinelAgent:
                 name=self.config.mcp_server_name,
                 url=self.config.mcp_url,
                 description=MCP_SERVER_DESCRIPTION,
+                headers=authorization_header(
+                    self.config.require_mcp_token()
+                ),
             )
 
         except TrueForgeError as exc:
@@ -285,10 +289,21 @@ class SentinelAgent:
             tools = self.client.list_mcp_tools(self.config.mcp_server_name)
 
         except TrueForgeError as exc:
+            hint = (
+                "Start it with: python mcp/sentinel_mcp/http_server.py"
+            )
+
+            if "401" in str(exc) or "unauthorized" in str(exc).lower():
+                hint = (
+                    "The MCP server rejected TrueForge's bearer token. Make "
+                    "sure both sides resolve the same token: either export "
+                    "SENTINEL_MCP_TOKEN for both, or let both use the "
+                    "generated .sentinel-mcp-token file."
+                )
+
             raise SentinelAgentError(
                 f"TrueForge could not load tools from the Sentinel MCP "
-                f"server at {self.config.mcp_url}: {exc}\n"
-                "Start it with: python mcp/sentinel_mcp/http_server.py"
+                f"server at {self.config.mcp_url}: {exc}\n{hint}"
             ) from exc
 
         names = [tool.get("name") for tool in tools]
@@ -317,15 +332,42 @@ class SentinelAgent:
                 f"'{self.config.agent_name}': {exc}"
             ) from exc
 
+    def ensure_model(self) -> str:
+        """Verify the configured model exists on this TrueForge instance.
+
+        A model that is not configured fails deep inside the turn with an
+        opaque provider error, so check it up front and name the
+        alternatives.
+        """
+
+        try:
+            available = [model["name"] for model in self.client.list_models()]
+
+        except TrueForgeError as exc:
+            raise SentinelAgentError(
+                f"Could not list TrueForge models: {exc}"
+            ) from exc
+
+        if self.config.model in available:
+            return self.config.model
+
+        raise SentinelAgentError(
+            f"Model '{self.config.model}' is not configured in TrueForge.\n"
+            f"Available: {available or '(none)'}\n"
+            "Add a provider under Settings -> Model Providers, or choose one "
+            "of the above with --model / $TRUEFORGE_MODEL."
+        )
+
     def provision(self) -> dict:
         """Make TrueForge ready to run an investigation."""
 
         self.client.ping()
 
+        model = self.ensure_model()
         tools = self.ensure_mcp_server()
         agent = self.ensure_agent()
 
-        return {"tools": tools, "agent": agent}
+        return {"model": model, "tools": tools, "agent": agent}
 
     # -----------------------------------------------------------------
     # Execution

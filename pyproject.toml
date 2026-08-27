@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sentinel"
 version = "0.1.0"
@@ -17,6 +21,14 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+
+[tool.setuptools]
+# Package discovery must be explicit. This is a flat layout with several
+# top-level directories, so setuptools auto-discovery fails outright -- and
+# worse, it treats the local `mcp/` directory as a package, which would
+# shadow the installed `mcp` SDK. `mcp/` and `data/` are run as scripts and
+# stay out of the distribution.
+packages = ["investigator", "trueforge"]
 
 [tool.pytest.ini_options]
 testpaths = ["investigator", "trueforge"]

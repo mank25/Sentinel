@@ -152,6 +152,52 @@ def test_register_mcp_server_builds_remote_manifest():
     }
 
 
+def test_register_mcp_server_attaches_header_auth():
+    http = FakeHTTP({
+        "PUT /settings/mcp-servers": _ok({"data": {"name": "sentinel"}}),
+    })
+
+    client = TrueForgeClient(_config(), http=http)
+    client.register_mcp_server(
+        "sentinel",
+        "http://127.0.0.1:8791/mcp",
+        "desc",
+        headers={"Authorization": "Bearer secret-token"},
+    )
+
+    manifest = http.requests[0]["json"]["manifest"]
+
+    assert manifest["auth"] == {
+        "type": "header",
+        "headers": {"Authorization": "Bearer secret-token"},
+    }
+
+
+def test_provisioning_registers_the_mcp_server_with_a_bearer_token():
+    """The HTTP transport must never be registered anonymously."""
+
+    http = FakeHTTP(_provision_routes([
+        "get_login_history",
+        "get_network_activity",
+        "assess_user_risk",
+    ]))
+
+    config = _config()
+    config.mcp_token = "unit-test-token"
+
+    agent = SentinelAgent(config, client=TrueForgeClient(config, http))
+    agent.ensure_mcp_server()
+
+    register = next(
+        req for req in http.requests
+        if req["method"] == "PUT"
+    )
+    auth = register["json"]["manifest"]["auth"]
+
+    assert auth["type"] == "header"
+    assert auth["headers"]["Authorization"] == "Bearer unit-test-token"
+
+
 def test_create_session_references_agent_by_name():
     http = FakeHTTP({
         "POST /sessions": _ok({"data": {"id": "sess-1"}}),
@@ -207,6 +253,15 @@ def test_list_turn_events_follows_pagination():
 # ------------------------------------------------------------------
 # Agent configuration
 # ------------------------------------------------------------------
+
+def test_default_model_is_not_the_known_broken_one():
+    """groq/gpt-oss-120b cannot complete a tool-using turn (see README)."""
+
+    from trueforge.config import DEFAULT_MODEL
+
+    assert DEFAULT_MODEL == "google-gemini/gemini-3-6-flash"
+    assert DEFAULT_MODEL != "groq/gpt-oss-120b"
+
 
 def test_agent_spec_follows_the_configured_model():
     """Switching provider/model must need no code change."""
@@ -282,6 +337,7 @@ def test_upsert_agent_updates_when_present():
 def _provision_routes(tools):
     return {
         "GET /capabilities": _ok({"data": {}}),
+        "GET /models": _ok({"data": [{"name": "groq/gpt-oss-120b"}]}),
         "PUT /settings/mcp-servers": _ok({"data": {"name": "sentinel"}}),
         "GET /mcp-servers/sentinel-security/tools": _ok({
             "data": [{"name": name} for name in tools]
@@ -331,6 +387,37 @@ def test_ensure_mcp_server_explains_unreachable_mcp_server():
         agent.ensure_mcp_server()
 
     assert "http_server.py" in str(excinfo.value)
+
+
+def test_ensure_model_accepts_a_configured_model():
+    routes = _provision_routes([])
+    routes["GET /models"] = _ok({
+        "data": [{"name": "groq/gpt-oss-120b"}, {"name": "other/model"}]
+    })
+
+    http = FakeHTTP(routes)
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    assert agent.ensure_model() == "groq/gpt-oss-120b"
+
+
+def test_ensure_model_rejects_an_unconfigured_model_with_alternatives():
+    routes = _provision_routes([])
+    routes["GET /models"] = _ok({"data": [{"name": "other/model"}]})
+
+    http = FakeHTTP(routes)
+    config = _config()
+    config.model = "missing/model"
+
+    agent = SentinelAgent(config, client=TrueForgeClient(config, http))
+
+    with pytest.raises(SentinelAgentError) as excinfo:
+        agent.ensure_model()
+
+    message = str(excinfo.value)
+
+    assert "missing/model" in message
+    assert "other/model" in message
 
 
 # ------------------------------------------------------------------

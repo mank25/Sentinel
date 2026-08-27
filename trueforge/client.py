@@ -159,6 +159,7 @@ class TrueForgeClient:
         name: str,
         url: str,
         description: str,
+        headers: dict | None = None,
     ) -> dict:
         """Create or replace a remote MCP server registration.
 
@@ -166,17 +167,23 @@ class TrueForgeClient:
         ``MCPServerType`` enum has the single value ``"remote"`` -- so the
         Sentinel MCP server must be reachable over HTTP.
 
+        ``headers`` becomes the manifest's ``header`` auth, which is how
+        TrueForge presents the Sentinel MCP bearer token on every call.
+
         PUT is create-or-replace, which makes this idempotent.
         """
 
-        payload = {
-            "manifest": {
-                "type": "remote",
-                "name": name,
-                "url": url,
-                "description": description,
-            }
+        manifest = {
+            "type": "remote",
+            "name": name,
+            "url": url,
+            "description": description,
         }
+
+        if headers:
+            manifest["auth"] = {"type": "header", "headers": dict(headers)}
+
+        payload = {"manifest": manifest}
 
         return self._data(
             self._request("PUT", "/settings/mcp-servers", json=payload),

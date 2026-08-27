@@ -50,6 +50,14 @@ over streamable HTTP for TrueForge — see the TrueForge section below:
 python mcp/sentinel_mcp/http_server.py
 ```
 
+The HTTP transport is **authenticated**. stdio needs no credentials (the
+client spawns the process), but a listening socket serving login histories
+and network intelligence does, so every request must carry
+`Authorization: Bearer <token>`. The token comes from `$SENTINEL_MCP_TOKEN`,
+or is generated once into `.sentinel-mcp-token` (mode 0600, gitignored). The
+server also refuses to bind to a non-loopback interface unless
+`SENTINEL_MCP_ALLOW_REMOTE=1` is set.
+
 `get_network_activity` distinguishes two negative outcomes, and the
 investigator keeps them apart:
 
@@ -207,9 +215,18 @@ results on `tool.response`, paired by `tool_call_id`). Nothing is synthesised.
 `--json` emits the full result including raw events, which is what a UI would
 consume later.
 
-### Known limitation: reasoning models on an OpenAI-compatible provider
+### Model choice
 
-With `groq/gpt-oss-120b`, a tool-using turn fails on the second model call:
+The default is `google-gemini/gemini-3-6-flash`, verified end-to-end against
+the seeded scenario. Override with `--model` or `$TRUEFORGE_MODEL`; the
+runner validates the model against `GET /api/v1/models` before starting a
+session and lists the alternatives if it is missing.
+
+Two requirements: **tool/function calling**, and enough context for a full
+login history (~1,900 tokens for the seeded `admin` account).
+
+**Known-incompatible: `groq/gpt-oss-120b`.** A tool-using turn fails on the
+second model call:
 
 ```
 'messages.2' : for 'role:assistant' the following must be satisfied
@@ -217,16 +234,15 @@ With `groq/gpt-oss-120b`, a tool-using turn fails on the second model call:
 ```
 
 TrueForge v0.1.4 persists the model's reasoning as `thinking_blocks` and
-replays it to the provider as `reasoning_content` on the assistant message;
-Groq's OpenAI-compatible API rejects that property on input. It is not
-triggered by anything in Sentinel -- MCP registration, tool discovery and the
-tool call itself all succeed first, and the deterministic pipeline is
-unaffected. `ModelParams` documents extra keys as "forwarded as-is", but
-v0.1.4 drops unknown keys, so `reasoning_format` cannot be used to work
-around it.
+replays it to the provider as `reasoning_content`; Groq's OpenAI-compatible
+API rejects that property on input. Nothing in Sentinel triggers it — MCP
+registration, tool discovery and the first tool call all succeed first. It is
+specific to reasoning models on providers that reject the field; Gemini,
+OpenAI and Anthropic all accept it. `ModelParams` documents extra keys as
+"forwarded as-is", but v0.1.4 drops unknown keys, so `reasoning_format`
+cannot be used to work around it.
 
-Until a non-reasoning model or a more tolerant provider is configured, the
-deterministic investigation runs without any LLM:
+The deterministic investigation always runs without any LLM:
 
 ```bash
 python -m investigator.run_investigation
@@ -238,3 +254,10 @@ python -m investigator.run_investigation
 pytest -q                 # unit tests only; no server required
 pytest -m integration -q  # needs TrueForge + the Sentinel MCP server running
 ```
+
+Integration tests skip **only** when a prerequisite is genuinely absent —
+TrueForge not running, the MCP server not running, or the configured model
+not registered. Once those are present nothing skips: a broken registration,
+provisioning failure or tool-orchestration regression fails the suite. The
+sole concession is a bounded retry for transient provider outages (503 /
+rate limiting), which retries and then fails.

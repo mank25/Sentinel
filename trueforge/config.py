@@ -1,15 +1,25 @@
 """Configuration for the Sentinel TrueForge integration.
 
-Everything is environment-driven with working local defaults. No secrets are
-read or stored here: the Groq API key lives in TrueForge's own model-provider
-settings, not in this repository.
+Everything is environment-driven with working local defaults. No model
+provider API key is read or stored here -- those live in TrueForge's own
+model-provider settings, not in this repository. The only secret this module
+touches is the Sentinel MCP bearer token (see :mod:`trueforge.mcp_auth`),
+which is generated locally and gitignored.
 """
 
 import os
 from dataclasses import dataclass, field
 
+from trueforge.mcp_auth import resolve_token
+
 DEFAULT_BASE_URL = "http://localhost:8790"
-DEFAULT_MODEL = "groq/gpt-oss-120b"
+
+# The default must be a model that can actually complete a tool-using turn.
+# groq/gpt-oss-120b cannot: TrueForge replays its reasoning to the provider as
+# `reasoning_content`, which Groq rejects, so the turn dies on the second
+# model call. gemini-3-6-flash is verified working end-to-end, and its 1M
+# context comfortably fits a full login history.
+DEFAULT_MODEL = "google-gemini/gemini-3-6-flash"
 DEFAULT_MCP_SERVER_NAME = "sentinel-security"
 DEFAULT_MCP_URL = "http://127.0.0.1:8791/mcp"
 DEFAULT_AGENT_NAME = "sentinel-investigator"
@@ -55,6 +65,19 @@ class TrueForgeConfig:
     agent_name: str = DEFAULT_AGENT_NAME
     timeout: float = DEFAULT_TIMEOUT
     tools: list = field(default_factory=lambda: list(SENTINEL_TOOLS))
+    # Bearer token the Sentinel MCP HTTP server requires. Resolved lazily so
+    # constructing a config never creates a token as a side effect.
+    mcp_token: str | None = None
+
+    def require_mcp_token(self) -> str:
+        """The token to register with TrueForge, generating one if needed."""
+
+        if not self.mcp_token:
+            from trueforge.mcp_auth import require_token
+
+            self.mcp_token = require_token()
+
+        return self.mcp_token
 
     @classmethod
     def from_env(cls) -> "TrueForgeConfig":
@@ -69,6 +92,7 @@ class TrueForgeConfig:
             mcp_url=_env("SENTINEL_MCP_URL", DEFAULT_MCP_URL),
             agent_name=_env("SENTINEL_AGENT_NAME", DEFAULT_AGENT_NAME),
             timeout=_env_float("TRUEFORGE_TIMEOUT", DEFAULT_TIMEOUT),
+            mcp_token=resolve_token(),
         )
 
     @property
