@@ -147,6 +147,11 @@ def _actions_for(action: str, target: str, db_path: Path) -> list:
     if not db_path.is_file():
         return []
 
+    # record_action stores target.strip(), so a lookup must strip too --
+    # otherwise " admin " is written as "admin" and then read back as
+    # uncontained, which would let the same account be contained twice.
+    target = (target or "").strip()
+
     with closing(_connect(db_path)) as connection:
         rows = connection.execute(
             """

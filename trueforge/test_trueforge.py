@@ -1086,3 +1086,62 @@ def test_no_approval_flag_means_interactive():
 
     assert args.approve is False
     assert args.deny is False
+
+
+# ---------------------------------------------------------------------
+# Regressions for the Qodo review on PR #5
+# ---------------------------------------------------------------------
+
+def test_resumed_response_still_pairs_with_its_call():
+    """Qodo #2: a tool.response in the resumed turn belongs to a
+    tool.call recorded before the pause.
+
+    Extracting each turn separately left the response with tool=None,
+    breaking the documented call/response pairing in --trace and in the
+    console, which renders the same trace.
+    """
+
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin", on_approval=allow_all)
+
+    responses = [
+        entry for entry in result["trace"]
+        if entry.get("step") == "tool.response"
+        and entry.get("tool_call_id") == "call-c1"
+    ]
+
+    assert responses, "the resumed tool.response is missing from the trace"
+
+    for response in responses:
+        assert response.get("tool") == "contain_account", (
+            "the resumed response lost its tool name"
+        )
+
+
+def test_raw_events_span_every_turn():
+    """Qodo #3: --json advertises the full raw history.
+
+    events was overwritten on each resume, so the original tool request
+    and the approval-required event vanished from the JSON output.
+    """
+
+    http = FakeHTTP(_approval_flow_routes(RESUMED_DONE, RESUMED_EVENTS))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin", on_approval=allow_all)
+    events = result["events"]
+
+    assert len(events) >= len(CONTAINMENT_EVENTS) + len(RESUMED_EVENTS), (
+        "events lost the turns before the resume"
+    )
+
+    types = [event.get("type") for event in events]
+
+    assert "tool.response" in types
+    assert any(
+        event.get("type") == "model.message"
+        and "Containment applied." in str(event.get("content", ""))
+        for event in events
+    ), "the resumed turn's events are missing"

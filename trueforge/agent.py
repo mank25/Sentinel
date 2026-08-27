@@ -498,6 +498,10 @@ class SentinelAgent:
         turn_id = turn["id"]
         turn = self.client.wait_for_turn(session_id, turn_id)
 
+        # Accumulated across every turn in this investigation. A resumed
+        # turn carries the tool.response for a tool.call made in the turn
+        # that paused, so the trace must be extracted from all of them
+        # together or the pairing is lost.
         events = self.client.list_turn_events(session_id, turn_id)
         trace = extract_trace(events)
         approvals = []
@@ -550,8 +554,14 @@ class SentinelAgent:
             turn_id = turn["id"]
             turn = self.client.wait_for_turn(session_id, turn_id)
 
-            events = self.client.list_turn_events(session_id, turn_id)
-            trace = trace + extract_trace(events)
+            events = events + self.client.list_turn_events(
+                session_id, turn_id
+            )
+
+            # Re-extract from the whole event history rather than appending
+            # a per-turn trace: a tool.response in this turn belongs to a
+            # tool.call recorded before the pause.
+            trace = extract_trace(events)
 
         state = turn.get("state", {})
         status = state.get("status")

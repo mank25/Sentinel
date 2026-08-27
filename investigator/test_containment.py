@@ -243,3 +243,37 @@ def test_evidence_tools_remain_annotated_read_only():
         annotations = tools[name].annotations
         assert annotations.read_only_hint is True, name
         assert annotations.destructive_hint is False, name
+
+
+def test_status_lookup_matches_a_padded_target(tmp_path):
+    """Qodo #4: the write path strips the target, so the read path must too.
+
+    Without this, containing " admin " stores "admin" and then reports the
+    account as uncontained -- which would let it be contained twice.
+    """
+
+    db = tmp_path / "containment.db"
+
+    containment.record_action(
+        containment.ACTION_CONTAIN_ACCOUNT,
+        "  admin  ",
+        "Confirmed compromise.",
+        db_path=db,
+    )
+
+    assert containment.account_status("  admin  ", db_path=db)["contained"]
+    assert containment.account_status("admin", db_path=db)["contained"]
+
+
+def test_ip_status_lookup_matches_a_padded_target(tmp_path):
+    db = tmp_path / "containment.db"
+
+    containment.record_action(
+        containment.ACTION_BLOCK_IP,
+        " 185.123.45.67 ",
+        "Suspicious reputation.",
+        db_path=db,
+    )
+
+    assert containment.ip_status(" 185.123.45.67 ", db_path=db)["blocked"]
+    assert containment.ip_status("185.123.45.67", db_path=db)["blocked"]
