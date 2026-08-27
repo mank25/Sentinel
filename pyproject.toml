@@ -31,7 +31,7 @@ dev = [
 packages = ["investigator", "trueforge"]
 
 [tool.pytest.ini_options]
-testpaths = ["investigator", "trueforge"]
+testpaths = ["investigator", "trueforge", "ui"]
 # Integration tests need a live TrueForge + Sentinel MCP server, so they are
 # excluded from a plain `pytest -q` run. Opt in with:
 #     pytest -m integration

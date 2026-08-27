@@ -6,3 +6,8 @@ __pycache__/
 data/*.db
 .sentinel-mcp-token
 *.egg-info/
+
+# Frontend
+ui/web/node_modules/
+# ui/web/dist is deliberately NOT ignored: it is committed so the console
+# runs with Python alone. npm is needed to change the frontend, not to run it.
