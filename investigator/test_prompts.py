@@ -15,6 +15,10 @@ LOWER = PROMPT.lower()
 
 TOOLS = ["get_login_history", "get_network_activity", "assess_user_risk"]
 
+# Accounts that exist in the seeded demo database. The prompt must not name
+# any of them: the username under investigation is supplied per run.
+SEEDED_USERNAMES = ["admin"]
+
 
 # ------------------------------------------------------------------
 # Role
@@ -73,8 +77,28 @@ def test_prompt_contains_no_hardcoded_ip_addresses():
 
 
 def test_prompt_contains_no_hardcoded_usernames_from_the_seed():
-    assert "185.123" not in PROMPT
-    assert "'admin'" not in PROMPT
+    """The account under investigation arrives as input, never as prose.
+
+    A literal seeded username would let the agent act on a remembered
+    account instead of the one it was asked about. Matched as a
+    case-insensitive whole word so quoting and capitalisation cannot slip
+    past -- `admin`, `ADMIN`, `'admin'`, `"admin"`, `the admin user` -- while
+    unrelated words that merely contain the substring, such as
+    "administrative" or "administrator", are left alone.
+    """
+
+    import re
+
+    for username in SEEDED_USERNAMES:
+        found = re.findall(
+            rf"\b{re.escape(username)}\b",
+            PROMPT,
+            flags=re.IGNORECASE,
+        )
+
+        assert found == [], (
+            f"prompt hardcodes the seeded username {username!r}: {found}"
+        )
 
 
 # ------------------------------------------------------------------
