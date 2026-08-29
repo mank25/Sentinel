@@ -1,4 +1,4 @@
-import type { RunEvent } from "./types";
+import type { Link, RunEvent } from "./types";
 
 /**
  * The operator token, present only when the console was bound beyond
@@ -7,6 +7,9 @@ import type { RunEvent } from "./types";
  * stream has to authenticate the same way every other route does.
  */
 const TOKEN = new URLSearchParams(window.location.search).get("token") ?? "";
+
+/** Backoff between reconnect attempts, in milliseconds. */
+const RETRY_DELAYS = [500, 1000, 2000, 4000, 8000];
 
 function url(path: string): string {
   return TOKEN ? `${path}?token=${encodeURIComponent(TOKEN)}` : path;
@@ -34,8 +37,17 @@ export async function startInvestigation(
   return response.json();
 }
 
+/**
+ * Answer one containment request.
+ *
+ * `gateId` names the exact gate being answered. The server refuses a
+ * decision that does not match the gate currently open (409), so a stale or
+ * duplicated click can never approve a containment action the operator was
+ * not shown.
+ */
 export async function sendDecision(
   runId: string,
+  gateId: string,
   allowed: boolean,
   reason: string,
 ): Promise<void> {
@@ -44,7 +56,7 @@ export async function sendDecision(
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ allowed, reason }),
+      body: JSON.stringify({ gate_id: gateId, allowed, reason }),
     },
   );
 
@@ -54,29 +66,96 @@ export async function sendDecision(
   }
 }
 
+interface FollowHandlers {
+  onEvent: (event: RunEvent) => void;
+  onLink: (link: Link) => void;
+}
+
 /**
- * Follow a run. The server replays the events already emitted before
- * streaming live ones, so subscribing late still renders the whole run.
+ * Follow a run, reconnecting through transient failures.
+ *
+ * The server replays a run from its first event, and every event carries a
+ * monotonic `seq`. So reconnecting is simply: open the same stream again and
+ * let the reducer drop anything at or below the highest seq already applied.
+ * That keeps one event-stream architecture rather than two -- there is no
+ * separate catch-up channel and no polling.
  */
 export function followRun(
   runId: string,
-  onEvent: (event: RunEvent) => void,
+  { onEvent, onLink }: FollowHandlers,
 ): () => void {
-  const source = new EventSource(
-    url(`/api/investigations/${runId}/events`),
-  );
+  let source: EventSource | null = null;
+  let attempt = 0;
+  let timer: number | undefined;
+  let stopped = false;
+  let finished = false;
 
-  source.onmessage = (message) => {
-    if (!message.data) return;
+  const open = () => {
+    if (stopped) return;
 
-    try {
-      onEvent(JSON.parse(message.data) as RunEvent);
-    } catch {
-      // A malformed frame should not tear down the stream.
-    }
+    source = new EventSource(url(`/api/investigations/${runId}/events`));
+
+    source.onopen = () => {
+      attempt = 0;
+      onLink("live");
+    };
+
+    source.onmessage = (message) => {
+      if (!message.data) return;
+
+      let event: RunEvent;
+
+      try {
+        event = JSON.parse(message.data) as RunEvent;
+      } catch {
+        // A malformed frame should not tear down the stream.
+        return;
+      }
+
+      if (event.kind === "complete" || event.kind === "error") {
+        finished = true;
+      }
+
+      onEvent(event);
+    };
+
+    source.onerror = () => {
+      source?.close();
+      source = null;
+
+      if (stopped) return;
+
+      // The server closes the stream once the run is over; that is a normal
+      // end, not a failure to retry.
+      if (finished) {
+        onLink("closed");
+        return;
+      }
+
+      if (attempt >= RETRY_DELAYS.length) {
+        onLink("closed");
+        onEvent({
+          seq: Number.MAX_SAFE_INTEGER,
+          kind: "error",
+          message:
+            "Lost the connection to the console and could not reconnect. " +
+            "The investigation may still be running on the server -- " +
+            "reload to rejoin it.",
+        });
+        return;
+      }
+
+      onLink("reconnecting");
+      timer = setTimeout(open, RETRY_DELAYS[attempt]) as unknown as number;
+      attempt += 1;
+    };
   };
 
-  source.onerror = () => source.close();
+  open();
 
-  return () => source.close();
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    source?.close();
+  };
 }

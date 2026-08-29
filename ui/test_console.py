@@ -3,18 +3,72 @@
 These use a fake agent, so they need neither TrueForge nor a model.
 """
 
+import threading
 import time
 
 import pytest
 from starlette.testclient import TestClient
 
+import ui.runner
 import ui.server
-from ui.runner import InvestigationRun, RunRegistry
+from ui.runner import (
+    DECISION_ACCEPTED,
+    DECISION_NO_GATE,
+    DECISION_STALE_GATE,
+    InvestigationRun,
+    RunRegistry,
+    parse_assessment,
+)
 from ui.server import app, main, registry, set_console_token
 
 
 class FakeAgent:
     """A SentinelAgent stand-in that always proposes containment."""
+
+    # Shaped exactly like extract_trace() output, so the runner's mapping is
+    # exercised against the real vocabulary rather than an invented one.
+    TRACE = [
+        {
+            "step": "mcp.initialize",
+            "server": "sentinel-security",
+            "transport": "remote",
+            "created_at": "2026-08-29T10:00:00Z",
+        },
+        {
+            "step": "tool.call",
+            "tool": "get_login_history",
+            "arguments": {"username": "admin"},
+            "tool_call_id": "t1",
+            "created_at": "2026-08-29T10:00:01Z",
+        },
+        {
+            "step": "tool.response",
+            "tool": "get_login_history",
+            "tool_call_id": "t1",
+            "content": '{"found": true, "login_events": []}',
+            "created_at": "2026-08-29T10:00:03Z",
+        },
+        {
+            "step": "tool.call",
+            "tool": "assess_user_risk",
+            "arguments": {"username": "admin"},
+            "tool_call_id": "t2",
+            "created_at": "2026-08-29T10:00:04Z",
+        },
+        {
+            "step": "tool.response",
+            "tool": "assess_user_risk",
+            "tool_call_id": "t2",
+            "content": (
+                '{"found": true, "username": "admin", '
+                '"threat_level": "CRITICAL", "risk_score": 100, '
+                '"risk_factors": [{"factor": "Privileged account", '
+                '"points": 30, "reason": "admin"}], '
+                '"incomplete_evidence": false}'
+            ),
+            "created_at": "2026-08-29T10:00:05Z",
+        },
+    ]
 
     def __init__(self, deny_reason_seen=None):
         self.seen = deny_reason_seen
@@ -31,7 +85,12 @@ class FakeAgent:
             "tools": ["get_login_history", "contain_account"],
         }
 
-    def investigate(self, username, provision=True, on_approval=None):
+    def investigate(
+        self, username, provision=True, on_approval=None, on_trace=None
+    ):
+        if on_trace:
+            on_trace(self.TRACE)
+
         pending = [{
             "thread_id": "main",
             "tool_call_id": "call_1",
@@ -67,6 +126,21 @@ def _wait(run, status, timeout=5.0):
     return False
 
 
+def _wait_for_event(run, kind, timeout=5.0):
+    """Return the first event of ``kind``, or fail once the deadline passes."""
+
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        for event in run.history():
+            if event["kind"] == kind:
+                return event
+
+        time.sleep(0.02)
+
+    raise AssertionError(f"no {kind!r} event within {timeout}s")
+
+
 def _wait_any(run, statuses, timeout=5.0):
     deadline = time.time() + timeout
 
@@ -89,7 +163,9 @@ def test_run_pauses_until_a_human_decides():
     assert run.result is None, "the run finished without a decision"
     assert run.pending[0]["tool"] == "contain_account"
 
-    run.decide(False, "False positive.")
+    assert run.decide(run.gate_id, False, "False positive.") == (
+        DECISION_ACCEPTED
+    )
 
     assert _wait_any(run, {"done", "error"}) == "done"
     assert run.result["approvals"][0]["allowed"] is False
@@ -100,7 +176,7 @@ def test_denial_reason_reaches_the_agent():
     run.start()
 
     assert _wait(run, "awaiting-approval")
-    run.decide(False, "VPN, not travel.")
+    run.decide(run.gate_id, False, "VPN, not travel.")
 
     assert _wait_any(run, {"done", "error"}) == "done"
     assert run.result["approvals"][0]["reason"] == "VPN, not travel."
@@ -111,7 +187,7 @@ def test_approval_executes_the_action():
     run.start()
 
     assert _wait(run, "awaiting-approval")
-    run.decide(True, "")
+    run.decide(run.gate_id, True, "")
 
     assert _wait_any(run, {"done", "error"}) == "done"
     assert run.result["approvals"][0]["allowed"] is True
@@ -122,7 +198,8 @@ def test_decision_is_rejected_when_not_paused():
 
     run = InvestigationRun("admin", agent_factory=FakeAgent)
 
-    assert run.decide(True, "") is False
+    assert run.gate_id is None
+    assert run.decide("anything", True, "") == DECISION_NO_GATE
 
 
 def test_history_replays_for_a_late_follower():
@@ -177,7 +254,11 @@ def test_investigation_endpoints():
 
         decided = client.post(
             f"/api/investigations/{run_id}/decision",
-            json={"allowed": False, "reason": "Not compromised."},
+            json={
+                "gate_id": run.gate_id,
+                "allowed": False,
+                "reason": "Not compromised.",
+            },
         )
         assert decided.status_code == 200
 
@@ -220,7 +301,9 @@ def test_registry_isolates_runs():
 class TwoGateAgent(FakeAgent):
     """An agent that pauses twice, as a multi-round investigation does."""
 
-    def investigate(self, username, provision=True, on_approval=None):
+    def investigate(
+        self, username, provision=True, on_approval=None, on_trace=None
+    ):
         rounds = []
 
         for call_id in ("call_1", "call_2"):
@@ -249,7 +332,9 @@ def test_a_second_gate_waits_for_its_own_decision():
 
     assert _wait(run, "awaiting-approval")
     assert run.pending[0]["tool_call_id"] == "call_1"
-    assert run.decide(False, "First.")
+
+    first_gate = run.gate_id
+    assert run.decide(first_gate, False, "First.") == DECISION_ACCEPTED
 
     # The agent opens a second gate; it must pause again rather than reuse
     # the decision just made.
@@ -257,7 +342,10 @@ def test_a_second_gate_waits_for_its_own_decision():
     assert run.pending[0]["tool_call_id"] == "call_2"
     assert run.result is None, "the run finished on one decision"
 
-    assert run.decide(True, "")
+    second_gate = run.gate_id
+    assert second_gate != first_gate, "the second gate reused the first id"
+
+    assert run.decide(second_gate, True, "") == DECISION_ACCEPTED
     assert _wait_any(run, {"done", "error"}) == "done"
 
     first, second = run.result["rounds"]
@@ -269,15 +357,182 @@ def test_a_second_gate_waits_for_its_own_decision():
     assert second[0]["approval"]["status"] == "allow"
 
 
-def test_a_decision_is_recorded_once():
-    """Two operators answering at the same gate produce one decision."""
+# ---------------------------------------------------------------------
+# Gate binding
+#
+# A decision answers one specific containment request. These tests exist
+# because the previous contract -- "release whichever gate is open" -- let a
+# duplicated answer land on a containment call the operator never saw.
+# ---------------------------------------------------------------------
+
+def test_a_gate1_decision_cannot_approve_gate2():
+    """The Phase 0 vulnerability, as a test.
+
+    Approve gate 1, let the run advance to gate 2, then replay the gate-1
+    answer. It must be refused, gate 2 must still be pending, and no second
+    containment may have been authorised.
+    """
 
     run = InvestigationRun("admin", agent_factory=TwoGateAgent)
     run.start()
 
     assert _wait(run, "awaiting-approval")
-    assert run.decide(False, "First.") is True
-    assert run.decide(True, "Second.") is False
+
+    gate_1 = run.gate_id
+    assert run.pending[0]["tool_call_id"] == "call_1"
+
+    assert run.decide(gate_1, True, "Confirmed malicious.") == (
+        DECISION_ACCEPTED
+    )
+
+    # The run advances and opens a second, different gate.
+    assert _wait(run, "awaiting-approval"), "the second gate did not pause"
+
+    gate_2 = run.gate_id
+    assert gate_2 != gate_1
+    assert run.pending[0]["tool_call_id"] == "call_2"
+
+    # The duplicated gate-1 answer: a second click, a second tab, a retried
+    # request. It must not authorise the action now on the table.
+    assert run.decide(gate_1, True, "Confirmed malicious.") == (
+        DECISION_STALE_GATE
+    )
+
+    # Gate 2 is untouched -- still open, still holding the run.
+    assert run.status == "awaiting-approval"
+    assert run.gate_id == gate_2
+    assert run.pending[0]["tool_call_id"] == "call_2"
+    assert run.result is None
+
+    # Only one decision was ever recorded.
+    decisions = [
+        event for event in run.history() if event["kind"] == "decision"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0]["gate_id"] == gate_1
+
+    # Answering the gate actually on the table still works.
+    assert run.decide(gate_2, False, "Shared VPN.") == DECISION_ACCEPTED
+    assert _wait_any(run, {"done", "error"}) == "done"
+
+    first, second = run.result["rounds"]
+    assert first[0]["approval"]["status"] == "allow"
+    assert second[0]["approval"]["status"] == "deny"
+
+
+def test_an_unknown_gate_id_is_refused():
+    """A guessed or fabricated gate id authorises nothing."""
+
+    run = InvestigationRun("admin", agent_factory=TwoGateAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    assert run.decide("not-a-real-gate", True, "") == DECISION_STALE_GATE
+    assert run.decide("", True, "") == DECISION_STALE_GATE
+    assert run.decide(run.id, True, "") == DECISION_STALE_GATE
+
+    # The gate still holds the run.
+    assert run.status == "awaiting-approval"
+    assert run.result is None
+    assert not [e for e in run.history() if e["kind"] == "decision"]
+
+
+def test_a_duplicate_decision_at_the_same_gate_is_refused():
+    """Answering twice does not answer twice."""
+
+    run = InvestigationRun("admin", agent_factory=TwoGateAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    gate_1 = run.gate_id
+
+    assert run.decide(gate_1, False, "First.") == DECISION_ACCEPTED
+    assert run.decide(gate_1, True, "Second.") in (
+        DECISION_NO_GATE,
+        DECISION_STALE_GATE,
+    )
+
+    decisions = [e for e in run.history() if e["kind"] == "decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["allowed"] is False
+
+
+def test_concurrent_decisions_produce_exactly_one():
+    """Two operators hitting Approve at the same instant produce one answer.
+
+    Both threads answer the gate they were shown, so at most one can win --
+    and the loser must not be carried forward to the next gate.
+    """
+
+    run = InvestigationRun("admin", agent_factory=TwoGateAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    gate_1 = run.gate_id
+    outcomes = []
+    barrier = threading.Barrier(2)
+
+    def answer(allowed, reason):
+        barrier.wait()
+        outcomes.append(run.decide(gate_1, allowed, reason))
+
+    threads = [
+        threading.Thread(target=answer, args=(True, "approve")),
+        threading.Thread(target=answer, args=(False, "deny")),
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count(DECISION_ACCEPTED) == 1, outcomes
+
+    # Whatever the loser answered, it did not become a second decision --
+    # and in particular it did not resolve gate 2.
+    assert _wait(run, "awaiting-approval"), "gate 2 did not open"
+    assert run.gate_id != gate_1
+
+    gate_1_decisions = [
+        e for e in run.history()
+        if e["kind"] == "decision" and e["gate_id"] == gate_1
+    ]
+    assert len(gate_1_decisions) == 1
+
+
+def test_a_timed_out_gate_cannot_be_answered_afterwards(monkeypatch):
+    """Timeout is a denial, and the retracted gate stays unanswerable."""
+
+    monkeypatch.setattr(ui.runner, "APPROVAL_TIMEOUT", 0.05)
+
+    run = InvestigationRun("admin", agent_factory=TwoGateAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    gate_1 = run.gate_id
+
+    # Let the gate lapse, then try to answer it.
+    assert _wait_any(run, {"awaiting-approval"}, timeout=1.0)
+
+    timed_out = _wait_for_event(run, "approval_timeout")
+    assert timed_out["gate_id"] == gate_1
+
+    assert run.decide(gate_1, True, "late") in (
+        DECISION_NO_GATE,
+        DECISION_STALE_GATE,
+    )
+
+    # Nothing was approved by the lapse.
+    approvals = [
+        e for e in run.history()
+        if e["kind"] == "decision" and e["gate_id"] == gate_1
+    ]
+    assert approvals == []
 
 
 def test_every_follower_sees_every_event():
@@ -349,10 +604,12 @@ def test_allowed_must_be_a_real_boolean():
 
         assert _wait(run, "awaiting-approval")
 
+        gate_id = run.gate_id
+
         for value in ("false", "true", 1, "yes", None):
             rejected = client.post(
                 f"/api/investigations/{run_id}/decision",
-                json={"allowed": value},
+                json={"gate_id": gate_id, "allowed": value},
             )
             assert rejected.status_code == 400, f"{value!r} was accepted"
 
@@ -361,7 +618,11 @@ def test_allowed_must_be_a_real_boolean():
 
         assert client.post(
             f"/api/investigations/{run_id}/decision",
-            json={"allowed": False, "reason": "Not compromised."},
+            json={
+                "gate_id": gate_id,
+                "allowed": False,
+                "reason": "Not compromised.",
+            },
         ).status_code == 200
 
         assert _wait_any(run, {"done", "error"}) == "done"
@@ -396,15 +657,17 @@ def test_token_guard_rejects_unauthenticated_requests():
 
         assert _wait(run, "awaiting-approval")
 
-        assert client.post(
-            f"/api/investigations/{run.id}/decision?token=s3cret",
-            json={"allowed": False},
-        ).status_code == 200
+        gate_id = run.gate_id
 
         assert client.post(
             f"/api/investigations/{run.id}/decision?token=wrong",
-            json={"allowed": True},
+            json={"gate_id": gate_id, "allowed": True},
         ).status_code == 401
+
+        assert client.post(
+            f"/api/investigations/{run.id}/decision?token=s3cret",
+            json={"gate_id": gate_id, "allowed": False},
+        ).status_code == 200
 
     finally:
         set_console_token(None)
@@ -422,3 +685,283 @@ def test_remote_binding_requires_a_token(monkeypatch):
         main(["--host", "0.0.0.0"])
 
     assert ui.server.CONSOLE_TOKEN is None, "a refused bind must not set a token"
+
+
+# ---------------------------------------------------------------------
+# Gate binding over HTTP
+# ---------------------------------------------------------------------
+
+def test_decision_endpoint_requires_a_gate_id():
+    """The route will not accept "approve whatever is open"."""
+
+    client, original = _client()
+
+    try:
+        started = client.post(
+            "/api/investigations", json={"username": "admin"}
+        )
+        run_id = started.json()["id"]
+        run = registry.get(run_id)
+
+        assert _wait(run, "awaiting-approval")
+
+        for body in (
+            {"allowed": True},
+            {"allowed": True, "gate_id": None},
+            {"allowed": True, "gate_id": ""},
+            {"allowed": True, "gate_id": "   "},
+            {"allowed": True, "gate_id": 12345},
+        ):
+            refused = client.post(
+                f"/api/investigations/{run_id}/decision", json=body
+            )
+            assert refused.status_code == 400, body
+            assert "gate_id" in refused.json()["error"]
+
+        # None of that touched the gate.
+        assert run.status == "awaiting-approval"
+        assert run.result is None
+
+    finally:
+        registry.create = original
+
+
+def test_decision_endpoint_refuses_an_unknown_gate_id():
+    client, original = _client()
+
+    try:
+        started = client.post(
+            "/api/investigations", json={"username": "admin"}
+        )
+        run_id = started.json()["id"]
+        run = registry.get(run_id)
+
+        assert _wait(run, "awaiting-approval")
+
+        refused = client.post(
+            f"/api/investigations/{run_id}/decision",
+            json={"gate_id": "deadbeef" * 4, "allowed": True},
+        )
+
+        assert refused.status_code == 409
+        assert refused.json()["outcome"] == DECISION_STALE_GATE
+        assert run.status == "awaiting-approval"
+
+    finally:
+        registry.create = original
+
+
+def test_decision_endpoint_refuses_a_stale_gate_id():
+    """The Phase 0 vulnerability, at the HTTP boundary."""
+
+    def two_gates(*args, **kwargs):
+        return TwoGateAgent()
+
+    client, original = _client(monkeyed_factory=two_gates)
+
+    try:
+        started = client.post(
+            "/api/investigations", json={"username": "admin"}
+        )
+        run_id = started.json()["id"]
+        run = registry.get(run_id)
+
+        assert _wait(run, "awaiting-approval")
+        gate_1 = run.gate_id
+
+        assert client.post(
+            f"/api/investigations/{run_id}/decision",
+            json={"gate_id": gate_1, "allowed": True},
+        ).status_code == 200
+
+        assert _wait(run, "awaiting-approval"), "gate 2 did not open"
+        assert run.gate_id != gate_1
+
+        # Replaying the gate-1 approval must not approve gate 2.
+        replayed = client.post(
+            f"/api/investigations/{run_id}/decision",
+            json={"gate_id": gate_1, "allowed": True},
+        )
+
+        assert replayed.status_code == 409
+        assert replayed.json()["outcome"] == DECISION_STALE_GATE
+        assert run.status == "awaiting-approval"
+        assert run.pending[0]["tool_call_id"] == "call_2"
+
+        decisions = [
+            e for e in run.history() if e["kind"] == "decision"
+        ]
+        assert len(decisions) == 1
+
+    finally:
+        registry.create = original
+
+
+# ---------------------------------------------------------------------
+# The live event pipeline
+# ---------------------------------------------------------------------
+
+def test_tool_activity_is_emitted_while_the_run_is_in_flight():
+    """Tool calls reach the console during the run, not only at the end."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.start()
+
+    # The gate is still open -- the run has not returned a result yet.
+    assert _wait(run, "awaiting-approval")
+    assert run.result is None
+
+    kinds = [event["kind"] for event in run.history()]
+
+    assert "mcp_ready" in kinds
+    assert kinds.count("tool_call") == 2
+    assert kinds.count("tool_result") == 2
+    assert "assessment" in kinds
+    assert "complete" not in kinds, "activity arrived only at the end"
+
+
+def test_tool_calls_and_results_correlate_by_tool_call_id():
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    calls = {
+        e["tool_call_id"]: e
+        for e in run.history() if e["kind"] == "tool_call"
+    }
+    results = {
+        e["tool_call_id"]: e
+        for e in run.history() if e["kind"] == "tool_result"
+    }
+
+    assert set(calls) == set(results) == {"t1", "t2"}
+    assert calls["t1"]["tool"] == "get_login_history"
+    assert calls["t1"]["arguments"] == {"username": "admin"}
+    assert results["t1"]["tool"] == "get_login_history"
+    assert calls["t2"]["tool"] == "assess_user_risk"
+
+
+def test_the_assessment_is_the_engines_verdict_verbatim():
+    """The console's threat level comes from the engine, not from prose."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    verdict = _wait_for_event(run, "assessment")
+
+    assert verdict["threat_level"] == "CRITICAL"
+    assert verdict["risk_score"] == 100
+    assert verdict["username"] == "admin"
+    assert verdict["risk_factors"][0]["factor"] == "Privileged account"
+    assert verdict["incomplete_evidence"] is False
+    assert run.assessment["risk_score"] == 100
+
+
+def test_parse_assessment_rejects_anything_that_is_not_a_verdict():
+    """A malformed or incomplete payload yields no score at all."""
+
+    assert parse_assessment(None) is None
+    assert parse_assessment("not json") is None
+    assert parse_assessment("[]") is None
+    assert parse_assessment('{"found": false, "error": "no such user"}') is None
+    # found, but the engine produced no numbers -- never invent them.
+    assert parse_assessment('{"found": true, "username": "admin"}') is None
+
+    # A list of MCP content blocks is unwrapped.
+    parsed = parse_assessment([
+        {"text": '{"found": true, "threat_level": "LOW", "risk_score": 0}'}
+    ])
+    assert parsed["threat_level"] == "LOW"
+    assert parsed["risk_score"] == 0
+
+
+def test_approval_required_carries_its_gate_id():
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    event = _wait_for_event(run, "approval_required")
+
+    assert event["gate_id"] == run.gate_id
+    assert event["pending"][0]["tool"] == "contain_account"
+
+    run.decide(run.gate_id, False, "No.")
+
+    decision = _wait_for_event(run, "decision")
+
+    assert decision["gate_id"] == event["gate_id"]
+    assert decision["allowed"] is False
+    assert decision["reason"] == "No."
+
+
+def test_events_are_sequenced_and_ordered():
+    """seq is monotonic, gapless and consistent across followers."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.start()
+
+    assert _wait_any(run, {"awaiting-approval"})
+    run.decide(run.gate_id, False, "")
+    assert _wait_any(run, {"done", "error"}) == "done"
+
+    seqs = [event["seq"] for event in run.history()]
+
+    assert seqs == list(range(1, len(seqs) + 1))
+
+
+def test_replay_after_reconnect_yields_no_duplicates():
+    """A follower that drops and replays sees each event exactly once.
+
+    This is the server half of the browser's reconnect: the backlog is the
+    whole run, and `seq` is what lets the client discard what it already
+    rendered.
+    """
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+
+    # First connection: read part of the run, then "drop".
+    first = run.follow(timeout=0.05)
+    seen = []
+
+    for _ in range(3):
+        event = next(first)
+
+        if event is not None:
+            seen.append(event)
+
+    first.close()
+
+    last_seq = seen[-1]["seq"]
+
+    run.decide(run.gate_id, False, "")
+    assert _wait_any(run, {"done", "error"}) == "done"
+
+    # Reconnect: replay everything, drop what was already rendered.
+    second = run.follow(timeout=0.05)
+    replayed = []
+
+    while True:
+        event = next(second)
+
+        if event is None:
+            break
+
+        replayed.append(event)
+
+    second.close()
+
+    fresh = [e for e in replayed if e["seq"] > last_seq]
+    combined = seen + fresh
+
+    # Every event, exactly once, in order.
+    assert [e["seq"] for e in combined] == list(
+        range(1, len(run.history()) + 1)
+    )
+    assert len(combined) == len(run.history())

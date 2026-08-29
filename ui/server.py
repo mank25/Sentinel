@@ -7,6 +7,11 @@ Four endpoints, deliberately:
     GET  /api/investigations/{id}/events   SSE: the run as it happens
     POST /api/investigations/{id}/decision allow or deny containment
 
+The decision route takes ``{"gate_id", "allowed", "reason"}``. The
+``gate_id`` is not ceremony: it binds the answer to the specific
+containment request the operator was shown, so a stale or duplicated
+decision is refused (409) instead of landing on the next one.
+
 The console holds no security logic. It starts investigations, streams what
 TrueForge reports, and carries a human's decision back to the paused turn.
 """
@@ -27,7 +32,11 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from trueforge.config import TrueForgeConfig
-from ui.runner import RunRegistry
+from ui.runner import (
+    DECISION_NO_GATE,
+    DECISION_STALE_GATE,
+    RunRegistry,
+)
 
 # The built React app. `dist` is committed, so running the console needs
 # only Python -- npm is required to *change* the frontend, not to run it.
@@ -185,7 +194,10 @@ async def decide(request):
     except (json.JSONDecodeError, ValueError):
         body = {}
 
-    allowed = body.get("allowed") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        body = {}
+
+    allowed = body.get("allowed")
 
     # Deliberately not bool(): a truthiness test reads the JSON string
     # "false" as an approval, and this value executes containment.
@@ -195,15 +207,48 @@ async def decide(request):
             status_code=400,
         )
 
+    gate_id = body.get("gate_id")
+
+    # An approval names the containment request it answers. Without one this
+    # route would mean "approve whichever gate is open right now", which is
+    # not a decision a human made about anything in particular.
+    if not isinstance(gate_id, str) or not gate_id.strip():
+        return JSONResponse(
+            {"error": "'gate_id' is required: name the gate you are answering."},
+            status_code=400,
+        )
+
     reason = (body.get("reason") or "").strip()
 
-    if not run.decide(allowed, reason):
+    outcome = run.decide(gate_id.strip(), allowed, reason)
+
+    if outcome == DECISION_NO_GATE:
         return JSONResponse(
-            {"error": f"This run is not awaiting a decision ({run.status})."},
+            {
+                "error": (
+                    f"This run is not awaiting a decision ({run.status})."
+                ),
+                "outcome": outcome,
+            },
             status_code=409,
         )
 
-    return JSONResponse({"status": run.status, "allowed": allowed})
+    if outcome == DECISION_STALE_GATE:
+        return JSONResponse(
+            {
+                "error": (
+                    "That approval request is no longer open. Sentinel is "
+                    "waiting on a different containment action -- review it "
+                    "and answer that one."
+                ),
+                "outcome": outcome,
+            },
+            status_code=409,
+        )
+
+    return JSONResponse(
+        {"status": run.status, "allowed": allowed, "gate_id": gate_id.strip()}
+    )
 
 
 def build_app():

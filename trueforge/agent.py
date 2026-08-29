@@ -16,6 +16,7 @@ scoring stays in :mod:`investigator.risk`, reachable only through the
 """
 
 import json
+import time
 
 from investigator.prompts import (
     SENTINEL_SYSTEM_PROMPT,
@@ -24,10 +25,19 @@ from investigator.prompts import (
 from trueforge.client import (
     TrueForgeClient,
     TrueForgeError,
+    TrueForgeProtocolError,
+    TrueForgeTimeout,
     approval_item,
 )
 from trueforge.config import TrueForgeConfig
 from trueforge.mcp_auth import authorization_header
+
+# How often a running turn is re-read while streaming its trace. This is
+# the same cadence TrueForgeClient.wait_for_turn polls at; the difference
+# is that each tick also collects the events recorded so far, so an
+# operator watching the console sees a tool call within a second of
+# TrueForge recording it rather than at the end of the run.
+POLL_INTERVAL = 1.0
 
 MCP_SERVER_DESCRIPTION = (
     "Read-only Sentinel security investigation tools: login history, "
@@ -453,12 +463,76 @@ class SentinelAgent:
     # Execution
     # -----------------------------------------------------------------
 
+    def _advance_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        prior_events: list,
+        emitted: int,
+        on_trace,
+    ) -> tuple:
+        """Wait for a turn to settle, streaming its trace as it is recorded.
+
+        Returns ``(turn, events, trace, emitted)``.
+
+        ``extract_trace`` is a prefix-stable function of the event list: it
+        walks events in order and appends entries, so the trace of a prefix
+        of the events is a prefix of the trace of all of them. That is what
+        makes incremental emission safe -- ``trace[emitted:]`` is exactly the
+        journey the operator has not seen yet, never a re-ordering of what
+        they have.
+
+        With no ``on_trace`` callback this collapses to the original
+        behaviour: wait for the turn, then read its events once.
+        """
+
+        if on_trace is None:
+            turn = self.client.wait_for_turn(session_id, turn_id)
+            events = prior_events + self.client.list_turn_events(
+                session_id, turn_id
+            )
+            trace = extract_trace(events)
+
+            return turn, events, trace, len(trace)
+
+        deadline = time.monotonic() + self.config.timeout
+
+        while True:
+            turn = self.client.get_turn(session_id, turn_id)
+            status = turn.get("state", {}).get("status")
+
+            if status is None:
+                raise TrueForgeProtocolError(
+                    f"Turn {turn_id} has no state.status: {str(turn)[:200]!r}"
+                )
+
+            events = prior_events + self.client.list_turn_events(
+                session_id, turn_id
+            )
+            trace = extract_trace(events)
+
+            if len(trace) > emitted:
+                on_trace(trace[emitted:])
+                emitted = len(trace)
+
+            if status != "running":
+                return turn, events, trace, emitted
+
+            if time.monotonic() >= deadline:
+                raise TrueForgeTimeout(
+                    f"Turn {turn_id} was still running after "
+                    f"{self.config.timeout}s"
+                )
+
+            time.sleep(POLL_INTERVAL)
+
     def investigate(
         self,
         username: str,
         provision: bool = True,
         on_approval=None,
         max_approval_rounds: int = 4,
+        on_trace=None,
     ) -> dict:
         """Run one investigation and return the response plus its trace.
 
@@ -467,6 +541,12 @@ class SentinelAgent:
         ``user.tool_approval`` items (see :func:`allow_all` / :func:`deny_all`
         / :func:`approval_item`). With no callback the run stops at the pause
         and reports what was requested -- nothing is ever auto-approved.
+
+        ``on_trace`` is called with each batch of newly-recorded trace
+        entries while the turn is still running, so a console can render the
+        investigation as it happens. The entries are the same ones the
+        returned ``trace`` contains -- nothing is synthesised for the live
+        view that is absent from the final one.
         """
 
         if provision:
@@ -496,14 +576,14 @@ class SentinelAgent:
             ) from exc
 
         turn_id = turn["id"]
-        turn = self.client.wait_for_turn(session_id, turn_id)
 
         # Accumulated across every turn in this investigation. A resumed
         # turn carries the tool.response for a tool.call made in the turn
         # that paused, so the trace must be extracted from all of them
         # together or the pairing is lost.
-        events = self.client.list_turn_events(session_id, turn_id)
-        trace = extract_trace(events)
+        turn, events, trace, emitted = self._advance_turn(
+            session_id, turn_id, [], 0, on_trace
+        )
         approvals = []
 
         # ------------------------------------------------------------
@@ -552,16 +632,13 @@ class SentinelAgent:
                 ) from exc
 
             turn_id = turn["id"]
-            turn = self.client.wait_for_turn(session_id, turn_id)
-
-            events = events + self.client.list_turn_events(
-                session_id, turn_id
-            )
 
             # Re-extract from the whole event history rather than appending
             # a per-turn trace: a tool.response in this turn belongs to a
             # tool.call recorded before the pause.
-            trace = extract_trace(events)
+            turn, events, trace, emitted = self._advance_turn(
+                session_id, turn_id, events, emitted, on_trace
+            )
 
         state = turn.get("state", {})
         status = state.get("status")

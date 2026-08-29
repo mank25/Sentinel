@@ -340,6 +340,15 @@ pytest -q                 # unit tests only; no server required
 pytest -m integration -q  # needs TrueForge + the Sentinel MCP server running
 ```
 
+The console's event-to-timeline transformation -- tool correlation, replay
+idempotence, the approval record -- is a pure function in
+`ui/web/src/correlate.ts`, tested without a browser and without adding a test
+framework (Node's own runner and native TypeScript stripping):
+
+```bash
+cd ui/web && npm test
+```
+
 Integration tests skip **only** when a prerequisite is genuinely absent —
 TrueForge not running, the MCP server not running, or the configured model
 not registered. Once those are present nothing skips: a broken registration,
@@ -362,17 +371,67 @@ Python alone -- npm is needed to *change* the frontend, not to run it.
 
 What it shows:
 
-- **What the agent is doing** -- provisioning, then each MCP tool call
-  TrueForge actually made, with its arguments and result, as it happens.
+- **What the agent is doing, while it does it** -- provisioning, then each
+  MCP tool call TrueForge actually made, with its arguments and its result,
+  streamed as TrueForge records it. The agent's turn is polled once a second
+  and the events recorded so far are re-read, so a tool call reaches the
+  console about a second after it happens rather than at the end of the run.
+  Nothing is synthesised: every row comes from an event TrueForge recorded.
 - **What it is waiting on** -- when TrueForge pauses the turn, the console
   renders the exact containment call, its arguments, and what it will do in
   plain words. Approve and Deny are the only ways forward.
-- **What it did** -- the verdict with the engine's threat level, and whether
-  containment was executed or blocked.
+- **What it decided, and who decided it** -- the deterministic risk engine's
+  score and threat level are shown next to, and visibly apart from, the
+  agent's narrative. See "The verdict is the engine's" below.
 
 The console holds no security logic. It starts investigations, streams what
 TrueForge reports, and carries a decision back to the paused turn. Scoring
 stays in `investigator/risk.py`; the gate stays in the harness.
+
+### An approval answers one specific request
+
+A decision names the gate it answers.
+
+Every pause mints a `gate_id`. It rides out on the `approval_required` event,
+the browser sends it back with the decision, and the server refuses anything
+that does not match the gate currently open:
+
+```
+POST /api/investigations/{id}/decision
+{"gate_id": "a358cc9a...", "allowed": false, "reason": "Shared VPN."}
+
+400  gate_id missing or not a string
+409  gate_id names a gate that is not the open one   -> nothing executes
+409  no gate is open at all                          -> nothing executes
+```
+
+This is not ceremony. Without it, a decision means "approve whatever gate
+happens to be open right now" -- so a duplicated click, a second browser tab,
+or a retried request could approve the *next* containment action, which the
+operator never saw. An investigation can pause more than once, and the two
+pauses can propose very different things. `test_a_gate1_decision_cannot_approve_gate2`
+in `ui/test_console.py` holds that line.
+
+### The verdict is the engine's
+
+The console never reads a threat level out of the model's prose.
+
+`assess_user_risk` is the deterministic engine's MCP tool. When its result
+comes back on the event stream, `ui/runner.py` parses it and republishes the
+score, threat level and risk factors as a structured `assessment` event --
+verbatim, with no recomputation, and dropped entirely rather than guessed at
+if the payload is not a completed assessment. The console renders that beside
+the agent's narrative, labelled, so the split is legible at a glance:
+
+```
+DETERMINISTIC RISK ENGINE          AI INVESTIGATOR
+100 / 100  CRITICAL                narrative, evidence, assessment
+6 evidence-backed factors
+Computed by investigator/risk.py
+```
+
+No scoring logic is duplicated in TypeScript. There is one scorer, and it is
+`investigator/risk.py`.
 
 ### Architecture
 
@@ -396,6 +455,12 @@ execute. The failure mode is "nothing happened", never "it went ahead".
 An investigation may pause more than once; each gate waits for its own
 decision, so an earlier answer can never release a containment call the
 operator has not seen.
+
+Every event carries a monotonic `seq`, and a follower is replayed the whole
+run from its first event. That makes reconnection trivial and safe: the
+browser retries with backoff, replays, and the reducer drops anything at or
+below the highest `seq` it has already rendered. No duplicates, no gaps,
+order preserved -- and no second event-stream architecture to maintain.
 
 ### Binding beyond this machine
 

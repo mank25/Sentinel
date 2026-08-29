@@ -371,3 +371,211 @@ button:not(:disabled):hover { filter: brightness(1.14); }
   font-family: var(--mono);
   white-space: pre-wrap;
 }
+
+/* ---------- live tool activity ---------- */
+
+.event-body { min-width: 0; }
+
+.event.note .icon { color: var(--accent); }
+.event.tool .icon { color: var(--info); }
+.event.agent .icon { color: var(--muted); }
+.event.approval { border-color: rgba(255, 184, 77, 0.4); }
+.event.approval .icon { color: var(--warn); }
+
+.pill.warn { border-color: rgba(255, 184, 77, 0.4); color: var(--warn); }
+
+.tool { margin-top: 2px; }
+
+.tool-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.tool-name { color: var(--text); font-weight: 600; }
+.tool-args { color: var(--dim); font-size: 12px; word-break: break-all; }
+
+.tool-state {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.tool.running .tool-state { color: var(--info); animation: pulse 1.3s ease-in-out infinite; }
+.tool.done .tool-state { color: var(--accent); }
+
+.facts {
+  margin: 9px 0 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 14px;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.fact { display: contents; }
+
+.fact dt {
+  color: var(--dim);
+  font-size: 11.5px;
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.fact dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: var(--mono);
+  word-break: break-word;
+}
+
+/* ---------- approval, recorded in the timeline ---------- */
+
+.gate-record .title { color: var(--warn); font-weight: 650; }
+
+.record-action {
+  margin-top: 9px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 7px;
+}
+
+.record-action code {
+  font-family: var(--mono);
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.record-action .why { margin-top: 5px; color: var(--dim); font-size: 12px; }
+
+.record-outcome {
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+
+.record-outcome.pending { color: var(--warn); }
+.record-outcome.approved { color: var(--danger); }
+.record-outcome.denied { color: var(--accent); }
+
+.gate-id {
+  margin-top: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 0.05em;
+}
+
+/* ---------- verdict: engine vs. narrative ---------- */
+
+.verdict-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) 1fr;
+  gap: 22px;
+  align-items: start;
+}
+
+@media (max-width: 760px) {
+  .verdict-grid { grid-template-columns: 1fr; }
+}
+
+.engine {
+  padding: 16px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+
+.engine-label {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--dim);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+
+.narrative-target {
+  margin-left: auto;
+  font-family: var(--mono);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--muted);
+}
+
+.score { display: flex; align-items: baseline; gap: 6px; }
+
+.score-value {
+  font-size: 42px;
+  font-weight: 700;
+  line-height: 1;
+  font-family: var(--mono);
+}
+
+.score-max { color: var(--dim); font-size: 14px; font-family: var(--mono); }
+
+.engine .level { display: inline-block; margin-top: 11px; }
+
+.engine-note { margin-top: 10px; color: var(--muted); font-size: 12px; }
+
+.factors { list-style: none; margin: 12px 0 0; padding: 0; }
+
+.factors li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.factor-name { font-size: 12.5px; color: var(--text); }
+
+.factor-points {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--warn);
+  text-align: right;
+}
+
+.factor-reason {
+  grid-column: 1 / -1;
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.gap {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: rgba(255, 184, 77, 0.09);
+  color: var(--warn);
+  font-size: 11.5px;
+}
+
+.provenance {
+  margin-top: 13px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.narrative { min-width: 0; }
+.narrative .body.dim { color: var(--dim); }
