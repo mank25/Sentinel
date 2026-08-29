@@ -1145,3 +1145,219 @@ def test_raw_events_span_every_turn():
         and "Containment applied." in str(event.get("content", ""))
         for event in events
     ), "the resumed turn's events are missing"
+
+
+# ------------------------------------------------------------------
+# Live trace streaming
+#
+# The console renders the investigation while it is running, so the agent
+# must hand out trace entries as TrueForge records them -- each one once,
+# in order, and identical to what the finished run reports.
+# ------------------------------------------------------------------
+
+def _streaming_routes(reveals, statuses):
+    """Reveal events progressively, one step per poll of the turn."""
+
+    routes = _provision_routes(ALL_TOOLS)
+    poll = {"n": 0}
+
+    def turn(_request):
+        index = min(poll["n"], len(statuses) - 1)
+        return _ok({
+            "data": {
+                "id": "turn-1",
+                "state": {
+                    "status": statuses[index],
+                    "output": {"content": "THREAT LEVEL: CRITICAL"},
+                    "required_actions": [],
+                },
+            }
+        })
+
+    def events(_request):
+        index = min(poll["n"], len(reveals) - 1)
+        payload = _ok({
+            "data": reveals[index],
+            "pagination": {"limit": 100},
+        })
+        poll["n"] += 1
+        return payload
+
+    routes.update({
+        "POST /sessions": _ok({"data": {"id": "sess-1"}}),
+        "POST /sessions/sess-1/turns": _ok({"data": {"id": "turn-1"}}),
+        "GET /sessions/sess-1/turns/turn-1": turn,
+        "GET /sessions/sess-1/turns/turn-1/events": events,
+    })
+
+    return routes
+
+
+def test_on_trace_streams_entries_as_they_are_recorded(monkeypatch):
+    """Trace entries reach the caller mid-turn, once each, in order."""
+
+    monkeypatch.setattr("trueforge.agent.POLL_INTERVAL", 0.001)
+
+    reveals = [
+        TRACE_EVENTS[:1],
+        TRACE_EVENTS[:3],
+        TRACE_EVENTS,
+    ]
+    statuses = ["running", "running", "done"]
+
+    http = FakeHTTP(_streaming_routes(reveals, statuses))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    batches = []
+    result = agent.investigate("admin", on_trace=batches.append)
+
+    # More than one batch: the caller saw the run unfold, not just its end.
+    assert len(batches) > 1
+
+    streamed = [entry for batch in batches for entry in batch]
+
+    # Every entry exactly once, and the same journey the run finally reports.
+    assert streamed == result["trace"]
+
+    # The first batch arrived before the tool calls existed.
+    assert [entry["step"] for entry in batches[0]] == ["mcp.initialize"]
+
+    # No entry was delivered twice.
+    ids = [
+        entry.get("tool_call_id")
+        for entry in streamed
+        if entry["step"] == "tool.call"
+    ]
+    assert len(ids) == len(set(ids))
+
+
+def test_on_trace_batches_never_overlap(monkeypatch):
+    """A slow turn that reveals nothing new emits nothing."""
+
+    monkeypatch.setattr("trueforge.agent.POLL_INTERVAL", 0.001)
+
+    reveals = [TRACE_EVENTS[:1], TRACE_EVENTS[:1], TRACE_EVENTS]
+    statuses = ["running", "running", "done"]
+
+    http = FakeHTTP(_streaming_routes(reveals, statuses))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    batches = []
+    agent.investigate("admin", on_trace=batches.append)
+
+    # The idle poll produced no batch at all -- not an empty one, and not a
+    # repeat of what was already sent.
+    assert all(batch for batch in batches)
+
+    streamed = [entry for batch in batches for entry in batch]
+    steps = [entry["step"] for entry in streamed]
+
+    assert steps.count("mcp.initialize") == 1
+
+
+def test_without_on_trace_the_turn_is_read_once():
+    """The CLI path keeps its original single-fetch behaviour."""
+
+    http = FakeHTTP(_investigation_routes({
+        "status": "done",
+        "output": {"content": "CRITICAL"},
+        "required_actions": [],
+    }))
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    result = agent.investigate("admin")
+
+    event_reads = [
+        request for request in http.requests
+        if request["url"].endswith("/events")
+    ]
+
+    assert len(event_reads) == 1
+    assert result["trace"]
+
+
+def test_streaming_survives_an_approval_pause(monkeypatch):
+    """Entries recorded after a resume continue the same stream."""
+
+    monkeypatch.setattr("trueforge.agent.POLL_INTERVAL", 0.001)
+
+    paused = {
+        "status": "awaiting_approval",
+        "output": {"content": ""},
+        "required_actions": [{
+            "type": "tool.approval_required",
+            "thread_id": "main",
+            "tool_calls": [{"id": "call-9"}],
+        }],
+    }
+    finished = {
+        "status": "done",
+        "output": {"content": "CRITICAL"},
+        "required_actions": [],
+    }
+
+    first_events = TRACE_EVENTS + [{
+        "type": "model.message",
+        "created_at": "t5",
+        "tool_calls": [{
+            "id": "call-9",
+            "function": {
+                "name": "contain_account",
+                "arguments": '{"username": "admin"}',
+            },
+        }],
+    }]
+    resumed_events = [{
+        "type": "tool.response",
+        "created_at": "t7",
+        "tool_call_id": "call-9",
+        "content": '{"ok": true}',
+    }]
+
+    routes = _provision_routes(ALL_TOOLS)
+    turns = {"n": 0}
+
+    def create_turn(_request):
+        turns["n"] += 1
+        return _ok({"data": {"id": f"turn-{turns['n']}"}})
+
+    routes.update({
+        "POST /sessions": _ok({"data": {"id": "sess-1"}}),
+        "POST /sessions/sess-1/turns": create_turn,
+        "GET /sessions/sess-1/turns/turn-1": _ok({
+            "data": {"id": "turn-1", "state": paused}
+        }),
+        "GET /sessions/sess-1/turns/turn-1/events": _ok({
+            "data": first_events, "pagination": {"limit": 100},
+        }),
+        "GET /sessions/sess-1/turns/turn-2": _ok({
+            "data": {"id": "turn-2", "state": finished}
+        }),
+        "GET /sessions/sess-1/turns/turn-2/events": _ok({
+            "data": resumed_events, "pagination": {"limit": 100},
+        }),
+    })
+
+    http = FakeHTTP(routes)
+    agent = SentinelAgent(_config(), client=TrueForgeClient(_config(), http))
+
+    batches = []
+    result = agent.investigate(
+        "admin", on_approval=allow_all, on_trace=batches.append
+    )
+
+    streamed = [entry for batch in batches for entry in batch]
+
+    # The whole journey, across the pause, exactly once.
+    assert streamed == result["trace"]
+
+    responses = [
+        entry for entry in streamed
+        if entry["step"] == "tool.response"
+        and entry["tool_call_id"] == "call-9"
+    ]
+
+    # The response recorded after the resume is paired with the call made
+    # before the pause.
+    assert len(responses) == 1
+    assert responses[0]["tool"] == "contain_account"

@@ -1,33 +1,91 @@
-import type { Approval } from "../types";
-
-const LEVELS = ["CRITICAL", "HIGH", "MEDIUM", "LOW"] as const;
-
-/** The threat level is the engine's, not the model's -- read it back out. */
-export function detectLevel(text: string): string | null {
-  const upper = text.toUpperCase();
-  return LEVELS.find((level) => upper.includes(level)) ?? null;
-}
+import type { Approval, Assessment } from "../types";
 
 interface Props {
   username: string;
-  response: string;
+  assessment: Assessment | null;
+  response: string | null;
   approvals: Approval[];
 }
 
-export function Verdict({ username, response, approvals }: Props) {
-  const level = detectLevel(response);
+/**
+ * The verdict, in two clearly separate halves.
+ *
+ * Left: the deterministic risk engine's own output -- score, threat level
+ * and the factors that justify them, copied verbatim from `assess_user_risk`.
+ * No language model contributed to any number here, and nothing in this file
+ * computes one.
+ *
+ * Right: the agent's narrative. It explains the evidence; it does not decide
+ * the score.
+ */
+export function Verdict({
+  username,
+  assessment,
+  response,
+  approvals,
+}: Props) {
+  const scoring = (assessment?.risk_factors ?? []).filter(
+    (factor) => factor.points > 0,
+  );
 
   return (
     <section className="verdict">
-      <div className="verdict-head">
-        {level && <span className={`level ${level}`}>{level}</span>}
-        <strong>Investigation complete</strong>
-        <span style={{ color: "var(--dim)", fontFamily: "var(--mono)" }}>
-          {username}
-        </span>
-      </div>
+      <div className="verdict-grid">
+        {assessment && (
+          <aside className="engine">
+            <div className="engine-label">Deterministic risk engine</div>
 
-      <div className="body">{response}</div>
+            <div className="score">
+              <span className="score-value">{assessment.risk_score}</span>
+              <span className="score-max">/ 100</span>
+            </div>
+
+            <span className={`level ${assessment.threat_level}`}>
+              {assessment.threat_level}
+            </span>
+
+            <div className="engine-note">
+              Based on {scoring.length} evidence-backed factor
+              {scoring.length === 1 ? "" : "s"}
+            </div>
+
+            <ul className="factors">
+              {(assessment.risk_factors ?? []).map((factor) => (
+                <li key={factor.factor}>
+                  <span className="factor-name">{factor.factor}</span>
+                  <span className="factor-points">
+                    {factor.points > 0 ? `+${factor.points}` : "—"}
+                  </span>
+                  <span className="factor-reason">{factor.reason}</span>
+                </li>
+              ))}
+            </ul>
+
+            {assessment.incomplete_evidence && (
+              <div className="gap">
+                Evidence was incomplete; findings may be partial.
+              </div>
+            )}
+
+            <div className="provenance">
+              Computed by investigator/risk.py — not by the model.
+            </div>
+          </aside>
+        )}
+
+        <div className="narrative">
+          <div className="engine-label">
+            AI investigator
+            <span className="narrative-target">{username}</span>
+          </div>
+
+          {response ? (
+            <div className="body">{response}</div>
+          ) : (
+            <div className="body dim">No narrative was produced.</div>
+          )}
+        </div>
+      </div>
 
       {approvals.map((approval, index) => (
         <div

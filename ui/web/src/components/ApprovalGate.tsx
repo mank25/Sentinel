@@ -1,29 +1,23 @@
 import { useState } from "react";
+import { CONSEQUENCE, formatCall } from "../correlate";
 import type { PendingAction } from "../types";
-
-/** Explains, in an operator's words, what a containment tool will do. */
-const CONSEQUENCE: Record<string, string> = {
-  contain_account:
-    "Disables the account. The user is signed out and cannot log back in.",
-  block_ip: "Blocks the address at the perimeter for all users.",
-};
 
 interface Props {
   pending: PendingAction[];
+  gateId: string | null;
   onDecide: (allowed: boolean, reason: string) => void;
   busy: boolean;
 }
 
-export function ApprovalGate({ pending, onDecide, busy }: Props) {
+/**
+ * The live decision point.
+ *
+ * `gateId` identifies the exact containment request on the table. It is sent
+ * with the decision, and the server refuses an answer that names any other
+ * gate -- so this card can only ever approve what it is currently showing.
+ */
+export function ApprovalGate({ pending, gateId, onDecide, busy }: Props) {
   const [reason, setReason] = useState("");
-
-  const format = (action: PendingAction) => {
-    const args = Object.entries(action.arguments ?? {})
-      .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
-      .join(", ");
-
-    return `${action.tool}(${args})`;
-  };
 
   return (
     <section className="gate" role="alertdialog" aria-live="assertive">
@@ -41,7 +35,7 @@ export function ApprovalGate({ pending, onDecide, busy }: Props) {
 
         {pending.map((action) => (
           <div className="action" key={action.tool_call_id}>
-            <code>{format(action)}</code>
+            <code>{formatCall(action.tool, action.arguments)}</code>
             <div className="why">
               {CONSEQUENCE[action.tool] ??
                 "This action changes system state."}
@@ -60,18 +54,20 @@ export function ApprovalGate({ pending, onDecide, busy }: Props) {
           <button
             className="btn-deny"
             onClick={() => onDecide(false, reason)}
-            disabled={busy}
+            disabled={busy || !gateId}
           >
             Deny
           </button>
           <button
             className="btn-approve"
             onClick={() => onDecide(true, reason)}
-            disabled={busy}
+            disabled={busy || !gateId}
           >
             Approve &amp; execute
           </button>
         </div>
+
+        {gateId && <div className="gate-id">gate {gateId.slice(0, 8)}</div>}
       </div>
     </section>
   );
