@@ -1,5 +1,17 @@
 import type { RunEvent } from "./types";
 
+/**
+ * The operator token, present only when the console was bound beyond
+ * loopback and started with one. It rides in the query string rather than
+ * an Authorization header because EventSource cannot set headers, and the
+ * stream has to authenticate the same way every other route does.
+ */
+const TOKEN = new URLSearchParams(window.location.search).get("token") ?? "";
+
+function url(path: string): string {
+  return TOKEN ? `${path}?token=${encodeURIComponent(TOKEN)}` : path;
+}
+
 export interface StartedRun {
   id: string;
   username: string;
@@ -8,7 +20,7 @@ export interface StartedRun {
 export async function startInvestigation(
   username: string,
 ): Promise<StartedRun> {
-  const response = await fetch("/api/investigations", {
+  const response = await fetch(url("/api/investigations"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ username }),
@@ -28,7 +40,7 @@ export async function sendDecision(
   reason: string,
 ): Promise<void> {
   const response = await fetch(
-    `/api/investigations/${runId}/decision`,
+    url(`/api/investigations/${runId}/decision`),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -51,7 +63,7 @@ export function followRun(
   onEvent: (event: RunEvent) => void,
 ): () => void {
   const source = new EventSource(
-    `/api/investigations/${runId}/events`,
+    url(`/api/investigations/${runId}/events`),
   );
 
   source.onmessage = (message) => {

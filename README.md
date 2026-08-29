@@ -393,6 +393,28 @@ trueforge/agent.py  -> TrueForge -> Sentinel MCP tools
 If the operator never answers, the run stays paused until it times out
 (`ui.runner.APPROVAL_TIMEOUT`, 10 minutes) and containment does **not**
 execute. The failure mode is "nothing happened", never "it went ahead".
+An investigation may pause more than once; each gate waits for its own
+decision, so an earlier answer can never release a containment call the
+operator has not seen.
+
+### Binding beyond this machine
+
+Every route can start an investigation, read its evidence trace, or approve
+containment of a production account. On `127.0.0.1` that is the operator's
+own machine. Anywhere else it is whoever can reach the port, so the console
+refuses to bind there without a shared token:
+
+```bash
+python -m ui.server --host 0.0.0.0 --token "$(openssl rand -hex 24)"
+```
+
+The token is then required on every request, as an `Authorization: Bearer`
+header or a `?token=` query parameter -- the query string is what the SSE
+stream uses, since `EventSource` cannot set headers. Open the URL the server
+prints on startup and the console carries the token for you.
+`SENTINEL_CONSOLE_TOKEN` sets it from the environment instead of the
+command line. This is a shared secret, not per-operator identity: put it
+behind a real proxy if you need accountable, per-person access.
 
 ### Frontend development
 

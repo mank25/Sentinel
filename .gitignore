@@ -6,6 +6,9 @@ __pycache__/
 data/*.db
 .sentinel-mcp-token
 *.egg-info/
+# `python -m build` output. Rooted, so ui/web/dist stays committed.
+/build/
+/dist/
 
 # Frontend
 ui/web/node_modules/

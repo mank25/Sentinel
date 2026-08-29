@@ -8,7 +8,8 @@ the decision arrives later on a separate request.
 :class:`InvestigationRun` bridges the two. The investigation runs on a worker
 thread; ``on_approval`` blocks that thread on an :class:`threading.Event`
 until the browser posts a decision. Nothing is ever auto-approved -- if the
-operator never answers, the run stays paused until it is cancelled.
+operator never answers, the run stays paused until the gate times out, and
+containment is not executed.
 """
 
 import queue
@@ -31,12 +32,14 @@ class InvestigationRun:
         self.status = "starting"
 
         self._agent_factory = agent_factory
-        self._events: queue.Queue = queue.Queue()
         self._history: list = []
+        self._followers: list[queue.Queue] = []
         self._lock = threading.Lock()
 
-        # Set when the operator decides; carries the decision items.
-        self._decided = threading.Event()
+        # Non-None only while a gate is open, and replaced for every gate.
+        # An investigation can pause more than once, so a decision must
+        # never outlive the gate it was made at.
+        self._gate: threading.Event | None = None
         self._decisions: list | None = None
 
         self.pending: list = []
@@ -52,10 +55,14 @@ class InvestigationRun:
 
         event = {"kind": kind, **payload}
 
+        # Appending to history and fanning out happen under one lock, so a
+        # follower registering concurrently sees the event on exactly one
+        # side of the boundary. The queues are unbounded; put never blocks.
         with self._lock:
             self._history.append(event)
 
-        self._events.put(event)
+            for follower in self._followers:
+                follower.put(event)
 
     def history(self) -> list:
         """Events already emitted, so a late follower sees the whole run."""
@@ -64,28 +71,71 @@ class InvestigationRun:
             return list(self._history)
 
     def follow(self, timeout: float = 1.0):
-        """Yield events as they arrive; ``None`` on idle so SSE can ping."""
+        """Yield this run's events -- the backlog first, then live ones.
 
-        while True:
-            try:
-                yield self._events.get(timeout=timeout)
+        Every follower gets its own queue. A shared queue would divide live
+        events between two open tabs (or between a stale connection and the
+        one that replaced it) instead of delivering each event to both, and
+        a console that missed an ``approval_required`` would sit blank while
+        the run waited on it.
 
-            except queue.Empty:
-                yield None
+        Registration happens under the same lock that appends to history, so
+        each event arrives exactly once: in the backlog or on the queue,
+        never both. ``None`` is yielded on idle so SSE can ping.
+        """
+
+        mine: queue.Queue = queue.Queue()
+
+        with self._lock:
+            backlog = list(self._history)
+            self._followers.append(mine)
+
+        try:
+            yield from backlog
+
+            while True:
+                try:
+                    yield mine.get(timeout=timeout)
+
+                except queue.Empty:
+                    yield None
+
+        finally:
+            with self._lock:
+                if mine in self._followers:
+                    self._followers.remove(mine)
 
     # -----------------------------------------------------------------
     # The approval gate
     # -----------------------------------------------------------------
 
     def _on_approval(self, pending: list) -> list:
-        """Called by the agent thread when TrueForge pauses the turn."""
+        """Called by the agent thread when TrueForge pauses the turn.
 
-        self.pending = pending
-        self.status = "awaiting-approval"
+        Each pause opens a fresh gate. The event and the decision slot are
+        per-gate rather than per-run: an investigation can pause several
+        times, and reusing them would let the first answer resume a later
+        gate immediately, carrying the earlier round's tool call ids.
+        """
+
+        gate = threading.Event()
+
+        with self._lock:
+            self.pending = list(pending)
+            self._decisions = None
+            self._gate = gate
+            self.status = "awaiting-approval"
+
         self.emit("approval_required", pending=pending)
 
-        # Block the investigation until a human answers.
-        if not self._decided.wait(timeout=APPROVAL_TIMEOUT):
+        if not gate.wait(timeout=APPROVAL_TIMEOUT):
+            with self._lock:
+                # Retract the gate only if it is still this one.
+                if self._gate is gate:
+                    self._gate = None
+                    self.pending = []
+                    self.status = "investigating"
+
             self.emit(
                 "approval_timeout",
                 message=(
@@ -94,38 +144,53 @@ class InvestigationRun:
                     "containment was not executed."
                 ),
             )
+
             return []
 
-        return self._decisions or []
+        with self._lock:
+            decisions = self._decisions or []
+            self._decisions = None
+
+        return decisions
 
     def decide(self, allowed: bool, reason: str = "") -> bool:
-        """Record the operator's decision and release the agent thread."""
+        """Record the operator's decision and release the agent thread.
 
-        if self.status != "awaiting-approval":
-            return False
+        False means no gate was open. A stray decision is dropped rather
+        than held, so it can never be applied to a later containment call
+        the operator has not seen.
+        """
 
-        self._decisions = [
-            approval_item(
-                item["thread_id"],
-                item["tool_call_id"],
-                allowed,
-                reason or None,
-            )
-            for item in self.pending
-        ]
+        with self._lock:
+            gate = self._gate
 
-        self.status = "resuming"
-        self.emit(
-            "decision",
-            allowed=allowed,
-            reason=reason,
-            actions=[
+            if gate is None:
+                return False
+
+            actions = [
                 {"tool": item["tool"], "arguments": item["arguments"]}
                 for item in self.pending
-            ],
-        )
+            ]
 
-        self._decided.set()
+            self._decisions = [
+                approval_item(
+                    item["thread_id"],
+                    item["tool_call_id"],
+                    allowed,
+                    reason or None,
+                )
+                for item in self.pending
+            ]
+
+            # Closing the gate under the same lock that read it means two
+            # operators answering at once produce one decision, not two.
+            self._gate = None
+            self.pending = []
+            self.status = "resuming"
+
+        self.emit("decision", allowed=allowed, reason=reason, actions=actions)
+
+        gate.set()
 
         return True
 

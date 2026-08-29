@@ -5,10 +5,12 @@ These use a fake agent, so they need neither TrueForge nor a model.
 
 import time
 
+import pytest
 from starlette.testclient import TestClient
 
+import ui.server
 from ui.runner import InvestigationRun, RunRegistry
-from ui.server import app, registry
+from ui.server import app, main, registry, set_console_token
 
 
 class FakeAgent:
@@ -209,3 +211,214 @@ def test_registry_isolates_runs():
     assert first.id != second.id
     assert registry_.get(first.id) is first
     assert registry_.get("nope") is None
+
+
+# ---------------------------------------------------------------------
+# Repeated gates, concurrent followers, and the token guard
+# ---------------------------------------------------------------------
+
+class TwoGateAgent(FakeAgent):
+    """An agent that pauses twice, as a multi-round investigation does."""
+
+    def investigate(self, username, provision=True, on_approval=None):
+        rounds = []
+
+        for call_id in ("call_1", "call_2"):
+            pending = [{
+                "thread_id": "main",
+                "tool_call_id": call_id,
+                "tool": "contain_account",
+                "arguments": {"username": username, "round": call_id},
+            }]
+            rounds.append(on_approval(pending))
+
+        return {
+            "username": username,
+            "response": "CRITICAL - impossible travel.",
+            "trace": [],
+            "approvals": [],
+            "rounds": rounds,
+        }
+
+
+def test_a_second_gate_waits_for_its_own_decision():
+    """The first answer must not resume a containment call nobody saw."""
+
+    run = InvestigationRun("admin", agent_factory=TwoGateAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+    assert run.pending[0]["tool_call_id"] == "call_1"
+    assert run.decide(False, "First.")
+
+    # The agent opens a second gate; it must pause again rather than reuse
+    # the decision just made.
+    assert _wait(run, "awaiting-approval"), "the second gate did not pause"
+    assert run.pending[0]["tool_call_id"] == "call_2"
+    assert run.result is None, "the run finished on one decision"
+
+    assert run.decide(True, "")
+    assert _wait_any(run, {"done", "error"}) == "done"
+
+    first, second = run.result["rounds"]
+
+    # Each round carries its own tool_call_id and its own answer.
+    assert first[0]["tool_call_id"] == "call_1"
+    assert first[0]["approval"]["status"] == "deny"
+    assert second[0]["tool_call_id"] == "call_2"
+    assert second[0]["approval"]["status"] == "allow"
+
+
+def test_a_decision_is_recorded_once():
+    """Two operators answering at the same gate produce one decision."""
+
+    run = InvestigationRun("admin", agent_factory=TwoGateAgent)
+    run.start()
+
+    assert _wait(run, "awaiting-approval")
+    assert run.decide(False, "First.") is True
+    assert run.decide(True, "Second.") is False
+
+
+def test_every_follower_sees_every_event():
+    """Two open tabs both get the run; they do not divide it between them."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+
+    first = run.follow(timeout=0.05)
+    second = run.follow(timeout=0.05)
+
+    # Registering is lazy: pull one idle tick so both generators subscribe.
+    assert next(first) is None
+    assert next(second) is None
+
+    run.emit("phase", phase="investigating", message="one")
+    run.emit("phase", phase="investigating", message="two")
+
+    for follower in (first, second):
+        seen = [event for event in (next(follower), next(follower))]
+        assert [event["message"] for event in seen] == ["one", "two"]
+
+    first.close()
+    second.close()
+
+
+def test_backlog_is_replayed_exactly_once():
+    """A late follower gets the history, and not a second copy of it."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+    run.emit("phase", phase="investigating", message="before")
+
+    follower = run.follow(timeout=0.05)
+
+    assert next(follower)["message"] == "before"
+
+    run.emit("phase", phase="investigating", message="after")
+
+    assert next(follower)["message"] == "after"
+
+    # Nothing left over: the backlog was not also queued.
+    assert next(follower) is None
+
+    follower.close()
+
+
+def test_a_closed_follower_is_deregistered():
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+
+    follower = run.follow(timeout=0.05)
+    assert next(follower) is None
+    follower.close()
+
+    run.emit("phase", phase="investigating", message="orphan")
+
+    assert run._followers == []
+
+
+def test_allowed_must_be_a_real_boolean():
+    """The JSON string "false" is not an approval to contain an account."""
+
+    client, original = _client()
+
+    try:
+        started = client.post(
+            "/api/investigations", json={"username": "admin"}
+        )
+        run_id = started.json()["id"]
+        run = registry.get(run_id)
+
+        assert _wait(run, "awaiting-approval")
+
+        for value in ("false", "true", 1, "yes", None):
+            rejected = client.post(
+                f"/api/investigations/{run_id}/decision",
+                json={"allowed": value},
+            )
+            assert rejected.status_code == 400, f"{value!r} was accepted"
+
+        # The gate is untouched: still waiting for a real answer.
+        assert run.status == "awaiting-approval"
+
+        assert client.post(
+            f"/api/investigations/{run_id}/decision",
+            json={"allowed": False, "reason": "Not compromised."},
+        ).status_code == 200
+
+        assert _wait_any(run, {"done", "error"}) == "done"
+
+    finally:
+        registry.create = original
+
+
+def test_token_guard_rejects_unauthenticated_requests():
+    """A console bound beyond loopback demands its token on every route."""
+
+    client, original = _client()
+    set_console_token("s3cret")
+
+    try:
+        assert client.post(
+            "/api/investigations", json={"username": "admin"}
+        ).status_code == 401
+
+        assert client.get("/api/investigations/anything/events").status_code == 401
+        assert client.get("/").status_code == 401
+
+        # A header works, and so does the query string EventSource needs.
+        started = client.post(
+            "/api/investigations",
+            json={"username": "admin"},
+            headers={"authorization": "Bearer s3cret"},
+        )
+        assert started.status_code == 200
+
+        run = registry.get(started.json()["id"])
+
+        assert _wait(run, "awaiting-approval")
+
+        assert client.post(
+            f"/api/investigations/{run.id}/decision?token=s3cret",
+            json={"allowed": False},
+        ).status_code == 200
+
+        assert client.post(
+            f"/api/investigations/{run.id}/decision?token=wrong",
+            json={"allowed": True},
+        ).status_code == 401
+
+    finally:
+        set_console_token(None)
+        registry.create = original
+
+
+def test_remote_binding_requires_a_token(monkeypatch):
+    """Exposing containment approval to the network is not a default."""
+
+    # Cleared so a token in the developer's own environment cannot let this
+    # test fall through parser.error() and actually start a server.
+    monkeypatch.delenv("SENTINEL_CONSOLE_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit):
+        main(["--host", "0.0.0.0"])
+
+    assert ui.server.CONSOLE_TOKEN is None, "a refused bind must not set a token"

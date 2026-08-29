@@ -15,6 +15,12 @@ dependencies = [
     # HTTP client for the TrueForge REST API. Ships as an mcp dependency but
     # trueforge/client.py imports it directly, so declare it explicitly.
     "httpx2>=2.12,<3",
+    # The operator console. Also mcp dependencies, and also imported
+    # directly -- ui/server.py is a Starlette app served by uvicorn, and
+    # streams the run over server-sent events.
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "sse-starlette>=2.1",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +34,13 @@ dev = [
 # worse, it treats the local `mcp/` directory as a package, which would
 # shadow the installed `mcp` SDK. `mcp/` and `data/` are run as scripts and
 # stay out of the distribution.
-packages = ["investigator", "trueforge"]
+packages = ["investigator", "trueforge", "ui"]
+
+[tool.setuptools.package-data]
+# `ui/web/dist` is the committed React build that ui/server.py serves. It is
+# not Python, so an explicit rule is what puts it in the wheel -- without it
+# an installed console answers every page request with BUILD_MISSING.
+ui = ["web/dist/*", "web/dist/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["investigator", "trueforge", "ui"]
