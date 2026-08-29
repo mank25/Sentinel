@@ -6,6 +6,11 @@ __pycache__/
 data/*.db
 .sentinel-mcp-token
 *.egg-info/
+# `python -m build` output. Rooted, so ui/web/dist stays committed.
+/build/
+/dist/
 
-
-ui/web/node_modules
+# Frontend
+ui/web/node_modules/
+# ui/web/dist is deliberately NOT ignored: it is committed so the console
+# runs with Python alone. npm is needed to change the frontend, not to run it.

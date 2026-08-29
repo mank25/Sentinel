@@ -346,3 +346,107 @@ not registered. Once those are present nothing skips: a broken registration,
 provisioning failure or tool-orchestration regression fails the suite. The
 sole concession is a bounded retry for transient provider outages (503 /
 rate limiting), which retries and then fails.
+
+## Operator console
+
+The console is where the approval gate becomes visible. A trace scrolling past
+in a terminal does not show an operator what the agent wants to do to a
+production account; a button next to the account name does.
+
+```bash
+python -m ui.server          # http://127.0.0.1:8792
+```
+
+That is the whole setup. `ui/web/dist` is committed, so the console runs with
+Python alone -- npm is needed to *change* the frontend, not to run it.
+
+What it shows:
+
+- **What the agent is doing** -- provisioning, then each MCP tool call
+  TrueForge actually made, with its arguments and result, as it happens.
+- **What it is waiting on** -- when TrueForge pauses the turn, the console
+  renders the exact containment call, its arguments, and what it will do in
+  plain words. Approve and Deny are the only ways forward.
+- **What it did** -- the verdict with the engine's threat level, and whether
+  containment was executed or blocked.
+
+The console holds no security logic. It starts investigations, streams what
+TrueForge reports, and carries a decision back to the paused turn. Scoring
+stays in `investigator/risk.py`; the gate stays in the harness.
+
+### Architecture
+
+```
+Browser (React)
+    |  POST /api/investigations        start
+    |  GET  .../events                 SSE: the run as it happens
+    |  POST .../decision               allow / deny
+    v
+ui/server.py  (Starlette)
+    v
+ui/runner.py     -- runs the investigation on a worker thread; the
+    |               on_approval callback blocks it on a threading.Event
+    v               until a human answers. Nothing is auto-approved.
+trueforge/agent.py  -> TrueForge -> Sentinel MCP tools
+```
+
+If the operator never answers, the run stays paused until it times out
+(`ui.runner.APPROVAL_TIMEOUT`, 10 minutes) and containment does **not**
+execute. The failure mode is "nothing happened", never "it went ahead".
+An investigation may pause more than once; each gate waits for its own
+decision, so an earlier answer can never release a containment call the
+operator has not seen.
+
+### Binding beyond this machine
+
+Every route can start an investigation, read its evidence trace, or approve
+containment of a production account. On `127.0.0.1` that is the operator's
+own machine. Anywhere else it is whoever can reach the port, so the console
+refuses to bind there without a shared token:
+
+```bash
+python -m ui.server --host 0.0.0.0 --token "$(openssl rand -hex 24)"
+```
+
+The token is then required on every request, as an `Authorization: Bearer`
+header or a `?token=` query parameter -- the query string is what the SSE
+stream uses, since `EventSource` cannot set headers. Open the URL the server
+prints on startup and the console carries the token for you.
+`SENTINEL_CONSOLE_TOKEN` sets it from the environment instead of the
+command line. This is a shared secret, not per-operator identity: put it
+behind a real proxy if you need accountable, per-person access.
+
+### Frontend development
+
+```bash
+cd ui/web
+npm install
+npm run dev      # Vite on :5173, proxies /api to the Python console
+npm run build    # refresh the committed dist/
+```
+
+### Tests
+
+`ui/test_console.py` drives the console with a fake agent, so it needs
+neither TrueForge nor a model. The tests that matter assert the gate holds:
+a run pauses and does not finish without a decision, a denial reason reaches
+the agent, and a decision posted outside the pause is rejected.
+
+## Qodo Code Review Evidence
+
+Every substantive change in Sentinel landed through a pull request reviewed by
+Qodo before merge. Nothing was pushed straight to `main`.
+
+| PR | Change | Qodo raised | Outcome |
+|---|---|---|---|
+| [#2](https://github.com/mank25/Sentinel/pull/2) | Investigation tools, risk engine, reporting | Batch the suspicious-IP lookups; run per-IP lookups concurrently | **Dismissed, deliberately.** Both are throughput optimisations for a serial `get_network_activity` loop. The seeded scenario correlates a handful of IPs against a 20 KB local SQLite file, so the round-trip cost is nil and concurrency would buy nothing measurable. Kept the serial loop because the execution trace stays a readable, ordered narrative — which is the point of an investigator. Revisit if the evidence store ever moves off-box. |
+| [#3](https://github.com/mank25/Sentinel/pull/3) | TrueForge integration, HTTP MCP transport | Unify the stdio runner and the MCP adapter on one async assessment pipeline | **Partly accepted, deferred in part.** Qodo's own recommendation was to keep the transport-isolated package and synchronous adapter, and it was right: making the deterministic analyzer/risk/report layers async would add complexity to code whose entire value is being simple and predictable. The duplicated pipeline wiring it identified is real, and `investigator/assessment.py` now exists as the single composition layer the MCP tool uses. Collapsing the stdio runner onto it too is the honest remaining follow-up. |
+| [#4](https://github.com/mank25/Sentinel/pull/4) | Prompt as behaviour contract + tests | Consider enforcing tool ordering deterministically in the runtime rather than in prose | **Dismissed, with reasoning.** Enforcing the order in code would duplicate the orchestration TrueForge already owns and would make the agent a fixed script rather than an investigator. The concern behind the finding — that prose instructions are not guarantees — is instead answered by tests: `investigator/test_prompts.py` fails the build if the prompt ever contains a literal IP or a scoring rule, so the model cannot fake evidence or invent a score even if it ignores the prose. |
+| [#5](https://github.com/mank25/Sentinel/pull/5) | Containment + human approval gate | *(in review)* | The PR asks Qodo two specific questions: whether the evidence/containment two-database split is the right boundary, and whether `resume_turn_with_approval` handles a turn completing between the poll and the resume. |
+
+The pattern worth noting: Qodo's most useful findings on this repo were
+architectural rather than defect-level, and the most valuable one (#3) was the
+duplicated composition path — which is why `investigator/assessment.py` exists.
+The performance suggestions were correct in general and wrong for this
+workload, which is the kind of call the review is there to prompt rather than
+to make.
