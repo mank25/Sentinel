@@ -316,6 +316,37 @@ def test_a_denial_must_be_respected():
     assert "do not retry it or work around it" in LOWER
 
 
+def test_requires_containment_to_be_verified_by_read_back():
+    """A tool call that returned is an attempt, not an outcome."""
+
+    assert "verify containment" in LOWER
+    assert "an attempt, not an outcome" in LOWER
+    assert "read the resulting state back" in LOWER
+
+
+def test_names_the_read_back_tool_for_each_containment_action():
+    assert "`get_account_status` after" in PROMPT
+    assert "`get_ip_status` after" in PROMPT
+
+
+def test_verification_verdict_is_a_fixed_two_way_choice():
+    """The report must commit to CONFIRMED or FAILED, not hedge."""
+
+    assert "VERIFICATION: CONFIRMED" in PROMPT
+    assert "VERIFICATION: FAILED" in PROMPT
+
+
+def test_success_may_not_be_claimed_from_the_call_itself():
+    assert "never write confirmed on the strength of the containment call" in LOWER
+    assert "only the read-back can confirm it" in LOWER
+
+
+def test_verification_is_skipped_when_nothing_was_approved():
+    """Nothing ran, so there is no outcome -- and nothing to report."""
+
+    assert "skip this step entirely when nothing was approved" in LOWER
+
+
 def test_containment_outcome_must_be_reported_honestly():
     assert "CONTAINMENT" in PROMPT
     assert "never describe a denied or unapproved action as though it" in LOWER

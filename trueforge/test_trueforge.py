@@ -29,7 +29,7 @@ from trueforge.client import (
     TrueForgeTimeout,
     TrueForgeUnavailable,
 )
-from trueforge.config import TrueForgeConfig
+from trueforge.config import SENTINEL_TOOLS, TrueForgeConfig
 
 import httpx2
 
@@ -86,14 +86,10 @@ class FakeHTTP:
         pass
 
 
-ALL_TOOLS = [
-    "get_login_history",
-    "get_network_activity",
-    "assess_user_risk",
-    "get_account_status",
-    "contain_account",
-    "block_ip",
-]
+# Derived from the config rather than restated, so adding a tool to the
+# agent cannot leave the fake MCP server behind: it would otherwise report
+# the new tool as missing in every test that provisions.
+ALL_TOOLS = list(SENTINEL_TOOLS)
 
 
 def _config():

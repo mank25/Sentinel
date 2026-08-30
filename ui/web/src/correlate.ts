@@ -100,7 +100,8 @@ const PURPOSE: Record<string, string> = {
   get_login_history: "Reading login evidence",
   get_network_activity: "Corroborating with network intelligence",
   assess_user_risk: "Deterministic risk engine",
-  get_account_status: "Checking existing containment",
+  get_account_status: "Verifying account containment state",
+  get_ip_status: "Verifying whether the address is blocked",
   contain_account: "Proposing account containment",
   block_ip: "Proposing an IP block",
 };
@@ -200,6 +201,16 @@ export function describeResult(
 
     case "get_account_status":
       add("contained", body.contained);
+      if (Array.isArray(body.containment_actions)) {
+        add("recorded actions", body.containment_actions.length);
+      }
+      break;
+
+    // The read-back half of a containment action. `blocked` is what
+    // actually confirms a block is in force -- block_ip's own return value
+    // only reports what it attempted.
+    case "get_ip_status":
+      add("blocked", body.blocked);
       if (Array.isArray(body.containment_actions)) {
         add("recorded actions", body.containment_actions.length);
       }

@@ -32,6 +32,7 @@ EVIDENCE_TOOLS = [
     "get_network_activity",
     "assess_user_risk",
     "get_account_status",
+    "get_ip_status",
 ]
 
 # Containment tools change state. They are annotated destructive on the MCP
