@@ -19,6 +19,7 @@ import json
 import time
 
 from investigator.prompts import (
+    DELEGATED_LEAD_PROMPT,
     SENTINEL_SYSTEM_PROMPT,
     investigation_request,
 )
@@ -85,20 +86,40 @@ class SentinelAgentError(TrueForgeError):
 def build_agent_spec(config: TrueForgeConfig) -> dict:
     """The TrueForge ``AgentSpec`` for the Sentinel investigator.
 
-    Every Sentinel tool is read-only and annotated as such, so none of them
-    require human approval. Sub-agents and generative UI are off so that the
-    execution trace stays a single linear investigation -- the tool calls are
-    the demonstrable part of the run, and a sub-agent would hide them in a
-    separate thread.
+    Two shapes, selected by ``config.delegate``:
 
-    ``iteration_limit`` doubles as a cost ceiling: a normal investigation
-    uses four or five model calls, and this caps a runaway loop well before
-    it becomes expensive.
+    * **Linear** (default) -- one thread. Subagents are off, so the trace is
+      a single readable investigation and every tool call is visible in it.
+    * **Delegated** -- a lead analyst that commissions specialist subagents
+      and correlates their findings. TrueForge gives each subagent its own
+      thread, which is precisely why tool results are correlated on
+      ``(thread_id, tool_call_id)`` rather than on the id alone.
+
+    What does **not** change between them is what anything is allowed to do.
+    ``require_approval_for_tools`` is attached to the MCP server, so it binds
+    the *tools* rather than the thread that calls them: a subagent invoking
+    ``block_ip`` is paused for a human exactly as the lead would be. The
+    delegation brief also tells specialists not to propose containment, but
+    that is about keeping the investigation coherent -- the gate is what
+    makes it safe, and the gate is in the harness.
+
+    Generative UI and user questions stay off in both shapes: they would put
+    turn-blocking interactions in front of the operator that are not the
+    containment decision, which is the one interaction this console exists
+    to present.
+
+    ``iteration_limit`` doubles as a cost ceiling. A linear investigation
+    uses four or five model calls; delegation needs materially more, because
+    each specialist runs its own loop, so the ceiling is raised only in that
+    shape and still caps a runaway loop well before it becomes expensive.
     """
 
     return {
         "model": {"name": config.model},
-        "instructions": SENTINEL_SYSTEM_PROMPT,
+        "instructions": (
+            DELEGATED_LEAD_PROMPT if config.delegate
+            else SENTINEL_SYSTEM_PROMPT
+        ),
         "mcp_servers": [
             {
                 "name": config.mcp_server_name,
@@ -116,9 +137,14 @@ def build_agent_spec(config: TrueForgeConfig) -> dict:
             }
         ],
         "config": {
-            "iteration_limit": 12,
+            "iteration_limit": 30 if config.delegate else 12,
+            # Sandbox execution is unavailable on this deployment: TrueForge
+            # v0.1.4 sandboxes are Daytona-backed and no sandbox provider is
+            # configured (GET /api/v1/settings/sandbox-providers returns
+            # "No sandbox provider configured"). Enabling it here would fail
+            # the turn rather than add a capability.
             "sandbox": {"enabled": False},
-            "dynamic_sub_agents": {"enabled": False},
+            "dynamic_sub_agents": {"enabled": bool(config.delegate)},
             "generative_ui": {"enabled": False},
             "ask_user_questions": {"enabled": False},
         },
@@ -486,14 +512,14 @@ class SentinelAgent:
 
         try:
             return self.client.upsert_agent(
-                self.config.agent_name,
+                self.config.effective_agent_name,
                 build_agent_spec(self.config),
             )
 
         except TrueForgeError as exc:
             raise SentinelAgentError(
                 f"Could not create the Sentinel agent "
-                f"'{self.config.agent_name}': {exc}"
+                f"'{self.config.effective_agent_name}': {exc}"
             ) from exc
 
     def ensure_model(self) -> str:
@@ -627,7 +653,9 @@ class SentinelAgent:
             self.provision()
 
         try:
-            session = self.client.create_session(self.config.agent_name)
+            session = self.client.create_session(
+                self.config.effective_agent_name
+            )
 
         except TrueForgeError as exc:
             raise SentinelAgentError(

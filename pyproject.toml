@@ -34,7 +34,7 @@ dev = [
 # worse, it treats the local `mcp/` directory as a package, which would
 # shadow the installed `mcp` SDK. `mcp/` and `data/` are run as scripts and
 # stay out of the distribution.
-packages = ["investigator", "trueforge", "ui"]
+packages = ["investigator", "trueforge", "ui", "sentinel"]
 
 [tool.setuptools.package-data]
 # `ui/web/dist` is the committed React build that ui/server.py serves. It is
@@ -43,7 +43,7 @@ packages = ["investigator", "trueforge", "ui"]
 ui = ["web/dist/*", "web/dist/assets/*"]
 
 [tool.pytest.ini_options]
-testpaths = ["investigator", "trueforge", "ui"]
+testpaths = ["investigator", "trueforge", "ui", "sentinel"]
 # Integration tests need a live TrueForge + Sentinel MCP server, so they are
 # excluded from a plain `pytest -q` run. Opt in with:
 #     pytest -m integration

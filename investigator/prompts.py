@@ -250,3 +250,76 @@ def investigation_request(username: str) -> str:
         f"Investigate the account '{username}' for signs of compromise. "
         "Gather the evidence with your tools, then report your findings."
     )
+
+
+# ---------------------------------------------------------------------
+# Delegated investigation
+#
+# An optional second mode. The lead agent gathers no evidence itself; it
+# commissions specialists and correlates what they return.
+#
+# What this changes: who reads which tool.
+# What it does not change: what any of them is allowed to do. Approval is
+# attached to the *tool* on the MCP server, not to the thread that calls it,
+# so a subagent proposing containment is paused exactly like the lead. The
+# paragraph below keeps the trace legible; it is not the control. Instruction
+# text is never the control -- that is the whole point of the gate.
+# ---------------------------------------------------------------------
+
+DELEGATION_BRIEF = """\
+
+## Working through specialists
+
+For this investigation you are the lead analyst. You do not read the evidence \
+yourself: you commission specialists, then correlate what they bring back.
+
+Create three subagents and give each one a specific question to answer, not a \
+job title:
+
+- **Identity Analyst** -- call `get_login_history` for the account. Report \
+the user's normal device and normal location, the shape of the \
+authentication activity, and which source IPs carry a real security signal \
+(failed authentication, failed MFA, or activity from an unknown device *and* \
+unknown location). Report the IPs; do not judge them.
+
+- **Timeline Analyst** -- call `get_login_history` for the account and read \
+the events in chronological order. Report the sequence: when activity \
+started, whether failures preceded a success and by how much, where the \
+authentication behaviour changes, and any clustering in time. Chronology \
+must be read from the timestamps, never inferred from counts.
+
+- **Network Analyst** -- you must pass this specialist the IPs the Identity \
+Analyst reported, because it cannot see the login evidence. It calls \
+`get_network_activity` for each one and reports reputation, whether the \
+source is known, country and connection volume, for every IP it was given. \
+A clean result is a finding and must be reported as one.
+
+Wait for all three, then do the work only you can do:
+
+1. **Correlate.** Tie their findings together -- which IP produced which \
+failures, at what times, from what device and location, and what the network \
+intelligence does to that picture. Two specialists agreeing is stronger \
+evidence than one asserting.
+
+2. **Note contradictions.** If two specialists disagree, say so plainly \
+rather than picking the more alarming answer.
+
+3. **Score, reconcile, and decide.** Call `assess_user_risk` yourself. Then \
+follow the method above from step 6: reconcile, consider containment, verify \
+it, and report.
+
+Two rules about delegation itself:
+
+- **A specialist reports; it does not act.** No subagent may propose or call \
+a containment tool. Containment is proposed once, by you, on the correlated \
+picture -- not by a specialist looking at one slice of it. (This keeps the \
+investigation coherent. It is not what makes containment safe: the approval \
+gate is attached to the containment tools themselves, so a subagent calling \
+one would be paused for a human exactly as you are.)
+- **Attribute your evidence.** In your report, say which specialist produced \
+each finding. A finding nobody can trace to a tool result is not evidence, \
+and that rule does not relax because a subagent is the one who read it.
+"""
+
+
+DELEGATED_LEAD_PROMPT = SENTINEL_SYSTEM_PROMPT + DELEGATION_BRIEF

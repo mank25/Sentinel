@@ -1782,3 +1782,159 @@ def test_approval_decisions_carry_the_requesting_thread():
 
     assert denied[0]["thread_id"] == "subagent-abc"
     assert denied[0]["approval"]["reason"] == "Shared VPN."
+
+
+# ---------------------------------------------------------------------
+# Delegated investigation
+#
+# Delegation changes who gathers the evidence. These hold that it changes
+# nothing about what anything is permitted to do -- and that the two shapes
+# stay distinct resources in TrueForge rather than overwriting each other.
+# ---------------------------------------------------------------------
+
+def _delegated_config():
+    config = _config()
+    config.delegate = True
+    return config
+
+
+def test_delegation_is_off_by_default():
+    """The reliable path is the default path."""
+
+    assert _config().delegate is False
+
+    spec = build_agent_spec(_config())
+
+    assert spec["config"]["dynamic_sub_agents"]["enabled"] is False
+
+
+def test_delegation_enables_dynamic_subagents():
+    spec = build_agent_spec(_delegated_config())
+
+    assert spec["config"]["dynamic_sub_agents"]["enabled"] is True
+
+
+def test_delegation_does_not_widen_the_approval_gate():
+    """A subagent must be gated exactly as the lead is.
+
+    The selector lives on the MCP server attachment, so it binds the tools
+    rather than the thread calling them. If this ever became thread-scoped,
+    a specialist could contain an account without a human.
+    """
+
+    for config in (_config(), _delegated_config()):
+        server = build_agent_spec(config)["mcp_servers"][0]
+
+        assert server["require_approval_for_tools"] == [
+            "@write", "@destructive"
+        ]
+
+
+def test_delegation_does_not_widen_the_tool_set():
+    linear = build_agent_spec(_config())["mcp_servers"][0]
+    delegated = build_agent_spec(_delegated_config())["mcp_servers"][0]
+
+    assert linear["enable_tools"] == delegated["enable_tools"]
+
+
+def test_delegated_prompt_extends_the_investigator_contract():
+    """The lead is still bound by every rule the linear agent has."""
+
+    from investigator.prompts import (
+        DELEGATED_LEAD_PROMPT,
+        SENTINEL_SYSTEM_PROMPT,
+    )
+
+    assert DELEGATED_LEAD_PROMPT.startswith(SENTINEL_SYSTEM_PROMPT)
+
+    spec = build_agent_spec(_delegated_config())
+
+    assert spec["instructions"] == DELEGATED_LEAD_PROMPT
+
+
+def test_delegated_prompt_still_hardcodes_no_ip_address():
+    """The delegation brief must not leak the answer either."""
+
+    import re
+
+    from investigator.prompts import DELEGATION_BRIEF
+
+    found = re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", DELEGATION_BRIEF)
+
+    assert found == [], f"delegation brief hardcodes IPs: {found}"
+
+
+def test_delegated_prompt_carries_no_scoring_rules():
+    import re
+
+    from investigator.prompts import DELEGATION_BRIEF
+
+    lower = DELEGATION_BRIEF.lower()
+
+    assert "points" not in lower
+    assert not re.search(r"\bscore\s*(>=|>|<)\s*\d", lower)
+
+
+def test_specialists_are_told_not_to_propose_containment():
+    from investigator.prompts import DELEGATION_BRIEF
+
+    lower = DELEGATION_BRIEF.lower()
+
+    assert "a specialist reports; it does not act" in lower
+    assert "no subagent may propose or call" in lower
+
+
+def test_the_brief_does_not_claim_instructions_are_the_control():
+    """Honesty about where the guarantee actually lives.
+
+    The brief tells specialists not to contain. If the project ever starts
+    presenting that sentence as the safety mechanism, the claim in the
+    README stops being true.
+    """
+
+    from investigator.prompts import DELEGATION_BRIEF
+
+    lower = DELEGATION_BRIEF.lower()
+
+    assert "it is not what makes containment safe" in lower
+    assert "approval gate is attached to the containment tools" in lower
+
+
+def test_delegation_raises_the_iteration_ceiling_but_keeps_one():
+    linear = build_agent_spec(_config())["config"]["iteration_limit"]
+    delegated = build_agent_spec(_delegated_config())["config"][
+        "iteration_limit"
+    ]
+
+    assert delegated > linear
+    assert delegated <= 1024, "TrueForge caps iteration_limit at 1024"
+
+
+def test_sandbox_stays_disabled_in_both_shapes():
+    """No sandbox provider is configured on this deployment.
+
+    Enabling it would fail the turn rather than add a capability, so the
+    honest setting is off -- in both shapes.
+    """
+
+    for config in (_config(), _delegated_config()):
+        assert build_agent_spec(config)["config"]["sandbox"] == {
+            "enabled": False
+        }
+
+
+def test_the_two_shapes_are_separate_trueforge_agents():
+    """Provisioning is create-or-replace; a shared name would clobber."""
+
+    assert _config().effective_agent_name != (
+        _delegated_config().effective_agent_name
+    )
+
+
+def test_an_explicit_agent_name_is_never_overridden():
+    """A caller who named the agent gets the agent they named."""
+
+    config = _delegated_config()
+    config.agent_name = "my-own-agent"
+
+    assert config.effective_agent_name == "my-own-agent"

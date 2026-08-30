@@ -67,6 +67,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Seconds to wait for the investigation turn.",
     )
+    parser.add_argument(
+        "--delegate",
+        action="store_true",
+        help="Investigate through specialist subagents (identity, timeline "
+             "and network) coordinated by a lead analyst, instead of one "
+             "linear thread. Each specialist runs on its own TrueForge "
+             "thread. Slower and more model calls; off by default.",
+    )
 
     approval = parser.add_mutually_exclusive_group()
     approval.add_argument(
@@ -202,6 +210,8 @@ def main(argv=None) -> int:
 
     if args.timeout:
         config.timeout = args.timeout
+
+    config.delegate = args.delegate
 
     try:
         with SentinelAgent(config) as agent:
