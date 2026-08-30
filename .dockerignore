@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+*.egg-info/
+ui/web/node_modules/
+data/*.db
+.sentinel-mcp-token
+.env
+.DS_Store

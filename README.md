@@ -65,6 +65,23 @@ python -m ui.server          # http://127.0.0.1:8792
 That is the whole setup — `ui/web/dist` is committed, so the console runs
 with Python alone. npm is needed to *change* the frontend, not to run it.
 
+### Hosting it
+
+The whole stack — TrueForge, the MCP server and the console — runs in one
+container, with only the console published:
+
+```bash
+docker build -t sentinel:live .
+docker run --rm -p 7860:7860 \
+  -e GEMINI_API_KEY="$GEMINI_API_KEY" \
+  -e SENTINEL_CONSOLE_TOKEN=demotoken \
+  sentinel:live
+```
+
+See [`deploy/README.md`](deploy/README.md) for free always-on hosting
+(Hugging Face Spaces, Render, Cloud Run), and for why serverless cannot work
+here — the approval gate pauses the turn for as long as the human takes.
+
 ---
 
 ## Architecture

@@ -434,6 +434,21 @@ class InvestigationRun:
                 )
 
             self.result = result
+
+            # A turn can finish without succeeding: a rejected provider key,
+            # an exhausted iteration limit, a cancelled turn. investigate()
+            # reports that on `error` rather than raising, and emitting
+            # "complete" regardless showed the operator an empty verdict and
+            # no reason for it. Surface the failure instead.
+            failure = result.get("error")
+
+            if failure:
+                self.error = failure
+                self.status = "error"
+
+                self.emit("error", message=failure)
+                return
+
             self.status = "done"
 
             self.emit(

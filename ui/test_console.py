@@ -1116,3 +1116,48 @@ def test_an_agent_message_carries_its_thread():
 
 def _never_called():
     raise AssertionError("these tests drive the trace callback directly")
+
+
+def test_a_failed_turn_is_reported_as_an_error_not_an_empty_verdict():
+    """A turn can finish without succeeding.
+
+    A rejected provider key, an exhausted iteration limit or a cancelled
+    turn all come back on `error` rather than raising. Emitting "complete"
+    regardless showed the operator a blank verdict and no reason for it --
+    which on a hosted demo is the difference between "your API key was
+    rejected" and a silently empty screen.
+    """
+
+    class FailingAgent:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return None
+
+        def provision(self):
+            return {"model": "m", "tools": ["get_login_history"]}
+
+        def investigate(self, username, **kwargs):
+            return {
+                "status": "error",
+                "response": "",
+                "error": "The model provider rejected the API key.",
+                "trace": [],
+                "tool_calls": [],
+                "approvals": [],
+                "pending_approvals": [],
+            }
+
+    run = InvestigationRun("admin", agent_factory=FailingAgent)
+    run.start()
+
+    _wait_any(run, ("error", "done"))
+
+    assert run.status == "error"
+    assert "rejected the API key" in run.error
+
+    kinds = [event["kind"] for event in run.history()]
+
+    assert "error" in kinds
+    assert "complete" not in kinds
