@@ -1361,3 +1361,428 @@ def test_streaming_survives_an_approval_pause(monkeypatch):
     # before the pause.
     assert len(responses) == 1
     assert responses[0]["tool"] == "contain_account"
+
+
+# ------------------------------------------------------------------
+# Thread-aware trace correlation
+#
+# A tool_call_id is minted per conversation by the model provider, so once a
+# turn can run more than one thread the id alone is not a unique identity.
+# These tests pin the identity to (thread_id, tool_call_id).
+# ------------------------------------------------------------------
+
+# The same tool_call_id, used by two different threads in one turn. This is
+# the case the old implementation got wrong.
+COLLIDING_THREAD_EVENTS = [
+    {
+        "type": "model.message",
+        "created_at": "t1",
+        "thread_id": "main",
+        "tool_calls": [
+            {
+                "id": "call_123",
+                "function": {
+                    "name": "get_login_history",
+                    "arguments": '{"username": "admin"}',
+                },
+            }
+        ],
+    },
+    {
+        "type": "thread.created",
+        "created_at": "t2",
+        "thread_id": "subagent-abc",
+        "agent_info": {
+            "type": "dynamic",
+            "name": "corroborate-ip",
+            "input": "Check 185.123.45.67",
+        },
+        "parent": {"thread_id": "main", "tool_call_id": "call_999"},
+    },
+    {
+        "type": "model.message",
+        "created_at": "t3",
+        "thread_id": "subagent-abc",
+        "tool_calls": [
+            {
+                "id": "call_123",
+                "function": {
+                    "name": "get_network_activity",
+                    "arguments": '{"ip_address": "185.123.45.67"}',
+                },
+            }
+        ],
+    },
+    {
+        "type": "tool.response",
+        "created_at": "t4",
+        "thread_id": "main",
+        "tool_call_id": "call_123",
+        "content": "LOGIN RESULT",
+    },
+    {
+        "type": "tool.response",
+        "created_at": "t5",
+        "thread_id": "subagent-abc",
+        "tool_call_id": "call_123",
+        "content": "NETWORK RESULT",
+    },
+    {
+        "type": "thread.done",
+        "created_at": "t6",
+        "thread_id": "subagent-abc",
+        "parent": {"thread_id": "main", "tool_call_id": "call_999"},
+    },
+]
+
+
+def _responses(trace):
+    return [e for e in trace if e["step"] == "tool.response"]
+
+
+def test_the_same_tool_call_id_in_two_threads_never_cross_correlates():
+    """The core regression: identity is (thread_id, tool_call_id).
+
+    `main` and `subagent-abc` both use `call_123`. Each response must resolve
+    to the tool its own thread called, and to nothing else. Correlating on
+    tool_call_id alone attaches the network result to the login lookup.
+    """
+
+    trace = extract_trace(COLLIDING_THREAD_EVENTS)
+
+    main_response, sub_response = _responses(trace)
+
+    # The pairing itself, asserted first: correlating on tool_call_id alone
+    # resolves both responses to whichever call was recorded last, so the
+    # login result comes back labelled get_network_activity.
+    assert main_response["content"] == "LOGIN RESULT"
+    assert main_response["tool"] == "get_login_history"
+
+    assert sub_response["content"] == "NETWORK RESULT"
+    assert sub_response["tool"] == "get_network_activity"
+
+    # Neither response was attributed to the other thread's tool.
+    assert main_response["tool"] != sub_response["tool"]
+
+    # Each is still stamped with the thread it belongs to, and the provider's
+    # id is unchanged.
+    assert main_response["thread_id"] == "main"
+    assert main_response["tool_call_id"] == "call_123"
+    assert sub_response["thread_id"] == "subagent-abc"
+    assert sub_response["tool_call_id"] == "call_123"
+
+
+def test_each_thread_keeps_its_own_tool_call():
+    """Both calls survive with their own thread and identical id."""
+
+    trace = extract_trace(COLLIDING_THREAD_EVENTS)
+    calls = [e for e in trace if e["step"] == "tool.call"]
+
+    assert [(c["thread_id"], c["tool_call_id"], c["tool"]) for c in calls] == [
+        ("main", "call_123", "get_login_history"),
+        ("subagent-abc", "call_123", "get_network_activity"),
+    ]
+
+    # The id is recorded exactly as TrueForge produced it -- never rewritten
+    # or namespaced into a synthetic value.
+    assert all(c["tool_call_id"] == "call_123" for c in calls)
+
+
+def test_thread_id_is_preserved_on_trace_entries():
+    trace = extract_trace(COLLIDING_THREAD_EVENTS)
+
+    for entry in trace:
+        assert "thread_id" in entry, entry["step"]
+
+    by_step = {}
+    for entry in trace:
+        by_step.setdefault(entry["step"], []).append(entry["thread_id"])
+
+    assert by_step["tool.call"] == ["main", "subagent-abc"]
+    assert by_step["tool.response"] == ["main", "subagent-abc"]
+    assert by_step["thread.created"] == ["subagent-abc"]
+    assert by_step["thread.done"] == ["subagent-abc"]
+
+
+def test_thread_lifecycle_events_are_recorded_with_their_parent():
+    trace = extract_trace(COLLIDING_THREAD_EVENTS)
+
+    created = next(e for e in trace if e["step"] == "thread.created")
+
+    assert created["thread_id"] == "subagent-abc"
+    assert created["name"] == "corroborate-ip"
+    assert created["parent_thread_id"] == "main"
+    assert created["parent_tool_call_id"] == "call_999"
+
+    done = next(e for e in trace if e["step"] == "thread.done")
+
+    assert done["thread_id"] == "subagent-abc"
+    assert done["parent_thread_id"] == "main"
+
+
+def test_interleaved_threads_pair_across_the_interleaving():
+    """A response is matched to its call even with another thread between."""
+
+    events = [
+        {
+            "type": "model.message",
+            "created_at": "t1",
+            "thread_id": "main",
+            "tool_calls": [{
+                "id": "dup",
+                "function": {"name": "get_login_history", "arguments": "{}"},
+            }],
+        },
+        {
+            "type": "model.message",
+            "created_at": "t2",
+            "thread_id": "sub-1",
+            "tool_calls": [{
+                "id": "dup",
+                "function": {"name": "get_network_activity", "arguments": "{}"},
+            }],
+        },
+        {
+            "type": "model.message",
+            "created_at": "t3",
+            "thread_id": "sub-2",
+            "tool_calls": [{
+                "id": "dup",
+                "function": {"name": "get_account_status", "arguments": "{}"},
+            }],
+        },
+        # Responses arrive in a different order than the calls were made.
+        {
+            "type": "tool.response", "created_at": "t4",
+            "thread_id": "sub-2", "tool_call_id": "dup", "content": "C",
+        },
+        {
+            "type": "tool.response", "created_at": "t5",
+            "thread_id": "main", "tool_call_id": "dup", "content": "A",
+        },
+        {
+            "type": "tool.response", "created_at": "t6",
+            "thread_id": "sub-1", "tool_call_id": "dup", "content": "B",
+        },
+    ]
+
+    resolved = [
+        (e["thread_id"], e["content"], e["tool"])
+        for e in _responses(extract_trace(events))
+    ]
+
+    assert resolved == [
+        ("sub-2", "C", "get_account_status"),
+        ("main", "A", "get_login_history"),
+        ("sub-1", "B", "get_network_activity"),
+    ]
+
+
+def test_a_response_from_an_unknown_thread_resolves_to_no_tool():
+    """A stray response is reported, not silently attached to someone else."""
+
+    events = [
+        {
+            "type": "model.message",
+            "created_at": "t1",
+            "thread_id": "main",
+            "tool_calls": [{
+                "id": "call_123",
+                "function": {"name": "get_login_history", "arguments": "{}"},
+            }],
+        },
+        {
+            "type": "tool.response", "created_at": "t2",
+            "thread_id": "ghost-thread", "tool_call_id": "call_123",
+            "content": "orphan",
+        },
+    ]
+
+    orphan = _responses(extract_trace(events))[0]
+
+    assert orphan["thread_id"] == "ghost-thread"
+    assert orphan["content"] == "orphan"
+    assert orphan["tool"] is None, "an orphan borrowed another thread's tool"
+
+
+def test_events_without_a_thread_id_are_read_as_the_main_thread():
+    """Traces recorded before subagents existed still correlate."""
+
+    trace = extract_trace(TRACE_EVENTS)
+
+    assert all(
+        entry["thread_id"] == "main"
+        for entry in trace
+        if "thread_id" in entry
+    )
+
+    # And the pairing is unchanged from the single-thread behaviour.
+    assert [e["step"] for e in trace] == [
+        "mcp.initialize",
+        "tool.call",
+        "tool.response",
+        "tool.call",
+        "tool.response",
+        "model.message",
+        "turn.done",
+    ]
+    assert trace[4]["tool"] == "get_network_activity"
+
+
+def test_a_null_thread_id_does_not_become_an_invented_thread():
+    """Run-level events carry thread_id: null; they read as main, not as a
+    fabricated thread name."""
+
+    trace = extract_trace([{
+        "type": "mcp.initialize",
+        "created_at": "t0",
+        "thread_id": None,
+        "mcp_servers": [{"name": "sentinel-security", "transport_type": "remote"}],
+    }])
+
+    assert trace[0]["thread_id"] == "main"
+
+
+def test_wrapped_events_keep_their_thread_id():
+    """The session-listing envelope must not hide the thread."""
+
+    wrapped = [
+        {"turn_id": "turn-1", "event": event}
+        for event in COLLIDING_THREAD_EVENTS
+    ]
+
+    assert extract_trace(wrapped) == extract_trace(COLLIDING_THREAD_EVENTS)
+
+
+def test_unknown_event_types_are_ignored():
+    """A new TrueForge event type must never break a trace."""
+
+    events = [
+        {"type": "sandbox.created", "created_at": "t0", "thread_id": None},
+        {"type": "model.message.delta", "created_at": "t1", "thread_id": "main"},
+        {"type": "some.future.event", "created_at": "t2", "thread_id": "main"},
+        {"type": "mcp.auth_required", "created_at": "t3", "thread_id": None},
+        {},
+    ]
+
+    assert extract_trace(events) == []
+
+    # And they do not disturb the events around them.
+    mixed = [events[0]] + list(TRACE_EVENTS) + [events[2]]
+
+    assert extract_trace(mixed) == extract_trace(TRACE_EVENTS)
+
+
+def test_extract_trace_is_prefix_stable_across_interleaved_threads():
+    """The invariant streaming depends on, now with several threads.
+
+    `_advance_turn` emits `trace[emitted:]` on every poll. That is only
+    correct while the trace of a prefix of the events is a prefix of the
+    trace of all of them -- including when threads interleave.
+    """
+
+    full = extract_trace(COLLIDING_THREAD_EVENTS)
+
+    for size in range(len(COLLIDING_THREAD_EVENTS) + 1):
+        partial = extract_trace(COLLIDING_THREAD_EVENTS[:size])
+
+        assert partial == full[:len(partial)], (
+            f"trace of the first {size} events is not a prefix of the whole"
+        )
+
+
+def test_pending_approvals_resolves_within_the_right_thread():
+    """An approval shows the arguments of the call it actually names.
+
+    Both threads have a pending call id `call_x`; only the subagent's is
+    awaiting approval. Resolving on the id alone would show the operator the
+    parent's arguments for an action the subagent requested.
+    """
+
+    # The subagent's containment request is recorded first and the parent's
+    # unrelated call second, so a lookup keyed on the id alone resolves to
+    # the parent's get_login_history -- the wrong action entirely.
+    events = [
+        {
+            "type": "model.message",
+            "created_at": "t1",
+            "thread_id": "subagent-abc",
+            "tool_calls": [{
+                "id": "call_x",
+                "function": {
+                    "name": "contain_account",
+                    "arguments": (
+                        '{"username": "root", "justification": "47 failures"}'
+                    ),
+                },
+            }],
+        },
+        {
+            "type": "model.message",
+            "created_at": "t2",
+            "thread_id": "main",
+            "tool_calls": [{
+                "id": "call_x",
+                "function": {
+                    "name": "get_login_history",
+                    "arguments": '{"username": "admin"}',
+                },
+            }],
+        },
+    ]
+
+    turn = {"state": {
+        "status": "done",
+        "required_actions": [{
+            "type": "tool.approval_required",
+            "thread_id": "subagent-abc",
+            "tool_calls": [{"id": "call_x", "source_event_id": "e2"}],
+        }],
+    }}
+
+    pending = pending_approvals(turn, extract_trace(events))
+
+    assert pending == [{
+        "thread_id": "subagent-abc",
+        "tool_call_id": "call_x",
+        "tool": "contain_account",
+        "arguments": {"username": "root", "justification": "47 failures"},
+    }]
+
+
+def test_pending_approvals_still_resolves_a_single_thread_turn():
+    """The existing main-thread behaviour is untouched."""
+
+    turn = {"state": PAUSED_STATE}
+
+    assert pending_approvals(turn, extract_trace(CONTAINMENT_EVENTS)) == [{
+        "thread_id": "main",
+        "tool_call_id": "call-c1",
+        "tool": "contain_account",
+        "arguments": {"username": "admin", "justification": "brute force"},
+    }]
+
+
+def test_approval_decisions_carry_the_requesting_thread():
+    """allow_all/deny_all send the decision back to the thread that asked.
+
+    TrueForge's user.tool_approval payload is (thread_id, tool_call_id), so
+    a subagent's request must be answered on the subagent's thread.
+    """
+
+    pending = [{
+        "thread_id": "subagent-abc",
+        "tool_call_id": "call_x",
+        "tool": "contain_account",
+        "arguments": {},
+    }]
+
+    allowed = allow_all(pending)
+    denied = deny_all(pending, "Shared VPN.")
+
+    assert allowed[0]["thread_id"] == "subagent-abc"
+    assert allowed[0]["tool_call_id"] == "call_x"
+    assert allowed[0]["approval"] == {"status": "allow"}
+
+    assert denied[0]["thread_id"] == "subagent-abc"
+    assert denied[0]["approval"]["reason"] == "Shared VPN."

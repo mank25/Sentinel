@@ -338,3 +338,108 @@ test("a second result cannot overwrite an already-answered call", () => {
     { label: "contained", value: "false" },
   ]);
 });
+
+test("a result correlates on (thread_id, tool_call_id), not the id alone", () => {
+  reset();
+
+  const state = reduceAll(initialState(), [
+    ev({
+      kind: "tool_call",
+      thread_id: "main",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      arguments: { username: "admin" },
+    }),
+    ev({
+      kind: "tool_call",
+      thread_id: "subagent-abc",
+      tool_call_id: "call_123",
+      tool: "get_network_activity",
+      arguments: { ip_address: "185.123.45.67" },
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: "subagent-abc",
+      tool_call_id: "call_123",
+      tool: "get_network_activity",
+      content: '{"found": true, "ip_address": "185.123.45.67", "reputation": "suspicious"}',
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: "main",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      content: '{"found": true, "login_events": [1, 2, 3]}',
+    }),
+  ]);
+
+  // Two calls, two results, no extra rows: each result found its own call.
+  assert.equal(state.items.length, 2);
+
+  const [main, sub] = state.items;
+
+  assert.equal(main.tool?.threadId, "main");
+  assert.equal(main.tool?.tool, "get_login_history");
+  assert.deepEqual(
+    main.tool?.facts.find((f) => f.label === "events returned"),
+    { label: "events returned", value: "3" },
+  );
+
+  assert.equal(sub.tool?.threadId, "subagent-abc");
+  assert.equal(sub.tool?.tool, "get_network_activity");
+  assert.deepEqual(
+    sub.tool?.facts.find((f) => f.label === "reputation"),
+    { label: "reputation", value: "suspicious" },
+  );
+});
+
+test("a result from an unknown thread does not claim another thread's call", () => {
+  reset();
+
+  const state = reduceAll(initialState(), [
+    ev({
+      kind: "tool_call",
+      thread_id: "main",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      arguments: {},
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: "ghost",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      content: '{"found": true, "login_events": []}',
+    }),
+  ]);
+
+  // The main call is still running; the orphan is shown on its own row.
+  assert.equal(state.items.length, 2);
+  assert.equal(state.items[0].tool?.status, "running");
+  assert.equal(state.items[1].tool?.threadId, "ghost");
+});
+
+test("events without a thread_id are treated as the main thread", () => {
+  reset();
+
+  const state = reduceAll(initialState(), [
+    ev({
+      kind: "tool_call",
+      thread_id: null,
+      tool_call_id: "c1",
+      tool: "get_login_history",
+      arguments: {},
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: null,
+      tool_call_id: "c1",
+      tool: "get_login_history",
+      content: '{"found": true, "login_events": []}',
+    }),
+  ]);
+
+  assert.equal(state.items.length, 1);
+  assert.equal(state.items[0].tool?.threadId, "main");
+  assert.equal(state.items[0].tool?.status, "done");
+});

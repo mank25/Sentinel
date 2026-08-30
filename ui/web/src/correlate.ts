@@ -25,6 +25,8 @@ import type {
 export type ToolStatus = "running" | "done";
 
 export interface ToolActivity {
+  /** The TrueForge thread that made the call ("main" for the root agent). */
+  threadId: string;
   toolCallId: string;
   tool: string;
   arguments: Record<string, unknown>;
@@ -219,6 +221,13 @@ export function describeResult(
   return facts;
 }
 
+/**
+ * The root agent's thread, used when an event carries no id.
+ *
+ * Mirrors `DEFAULT_THREAD_ID` in trueforge/agent.py.
+ */
+const MAIN_THREAD = "main";
+
 function duration(from?: string, to?: string): number | undefined {
   if (!from || !to) return undefined;
 
@@ -291,6 +300,7 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
 
     case "tool_call": {
       const toolCallId = event.tool_call_id ?? `seq-${event.seq}`;
+      const threadId = event.thread_id ?? MAIN_THREAD;
       const tool = event.tool ?? "(unnamed tool)";
 
       return {
@@ -302,6 +312,7 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
             title: tool,
             sub: PURPOSE[tool],
             tool: {
+              threadId,
               toolCallId,
               tool,
               arguments: event.arguments ?? {},
@@ -317,11 +328,17 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
 
     case "tool_result": {
       const id = event.tool_call_id;
+      const threadId = event.thread_id ?? MAIN_THREAD;
       let matched = false;
 
       const items = next.items.map((item) => {
         if (matched || !item.tool) return item;
+        // A result belongs to the call with the same id *on the same
+        // thread*. tool_call_id is minted per conversation, so two threads
+        // can produce the same one; matching on it alone would attach a
+        // subagent's result to the parent's call.
         if (id === null || item.tool.toolCallId !== id) return item;
+        if (item.tool.threadId !== threadId) return item;
         if (item.tool.status === "done") return item;
 
         matched = true;
@@ -349,6 +366,7 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
               kind: "tool",
               title: event.tool ?? "tool result",
               tool: {
+                threadId,
                 toolCallId: id ?? `seq-${event.seq}`,
                 tool: event.tool ?? "(unknown)",
                 arguments: {},

@@ -201,6 +201,11 @@ class InvestigationRun:
         Called from the agent thread while the turn is still running. Every
         entry here came from an event TrueForge actually recorded -- this
         maps them onto the console's event vocabulary and adds nothing.
+
+        ``thread_id`` rides along on the tool events because the console
+        correlates a result to its call exactly the way
+        :func:`trueforge.agent.extract_trace` does -- on
+        ``(thread_id, tool_call_id)``, never on the id alone.
         """
 
         for entry in entries:
@@ -217,6 +222,7 @@ class InvestigationRun:
             elif step == "tool.call":
                 self.emit(
                     "tool_call",
+                    thread_id=entry.get("thread_id"),
                     tool_call_id=entry.get("tool_call_id"),
                     tool=entry.get("tool"),
                     arguments=entry.get("arguments", {}),
@@ -226,6 +232,7 @@ class InvestigationRun:
             elif step == "tool.response":
                 self.emit(
                     "tool_result",
+                    thread_id=entry.get("thread_id"),
                     tool_call_id=entry.get("tool_call_id"),
                     tool=entry.get("tool"),
                     content=entry.get("content"),

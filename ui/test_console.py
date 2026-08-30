@@ -965,3 +965,48 @@ def test_replay_after_reconnect_yields_no_duplicates():
         range(1, len(run.history()) + 1)
     )
     assert len(combined) == len(run.history())
+
+
+def test_tool_events_carry_the_thread_that_made_the_call():
+    """The console correlates on (thread_id, tool_call_id), so the runner
+    must publish the thread alongside the id."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+
+    run._on_trace([
+        {
+            "step": "tool.call",
+            "tool": "get_login_history",
+            "arguments": {"username": "admin"},
+            "thread_id": "main",
+            "tool_call_id": "call_123",
+            "created_at": "2026-08-30T10:00:00Z",
+        },
+        {
+            "step": "tool.call",
+            "tool": "get_network_activity",
+            "arguments": {"ip_address": "185.123.45.67"},
+            "thread_id": "subagent-abc",
+            "tool_call_id": "call_123",
+            "created_at": "2026-08-30T10:00:01Z",
+        },
+        {
+            "step": "tool.response",
+            "tool": "get_network_activity",
+            "thread_id": "subagent-abc",
+            "tool_call_id": "call_123",
+            "content": '{"found": true}',
+            "created_at": "2026-08-30T10:00:02Z",
+        },
+    ])
+
+    calls = [e for e in run.history() if e["kind"] == "tool_call"]
+    results = [e for e in run.history() if e["kind"] == "tool_result"]
+
+    # The same tool_call_id on two threads stays distinguishable downstream.
+    assert [(c["thread_id"], c["tool_call_id"]) for c in calls] == [
+        ("main", "call_123"),
+        ("subagent-abc", "call_123"),
+    ]
+    assert results[0]["thread_id"] == "subagent-abc"
+    assert results[0]["tool_call_id"] == "call_123"

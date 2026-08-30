@@ -63,6 +63,7 @@ export type RunEvent = Seq &
       }
     | {
         kind: "tool_call";
+        thread_id: string | null;
         tool_call_id: string | null;
         tool: string | null;
         arguments: Record<string, unknown>;
@@ -70,6 +71,7 @@ export type RunEvent = Seq &
       }
     | {
         kind: "tool_result";
+        thread_id: string | null;
         tool_call_id: string | null;
         tool: string | null;
         content: string | null;

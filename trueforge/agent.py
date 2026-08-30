@@ -145,12 +145,45 @@ def _parse_arguments(raw):
         return {"_raw": raw}
 
 
+# The root agent's thread. TrueForge stamps `thread_id` on every
+# thread-scoped event and names the root thread "main"; each subagent gets a
+# minted id. Events recorded before subagents existed carry no field at all,
+# so reading a missing one as the main thread keeps old traces correct.
+DEFAULT_THREAD_ID = "main"
+
+
+def _thread_of(event: dict) -> str:
+    """The thread an event belongs to.
+
+    Falls back to :data:`DEFAULT_THREAD_ID` only when the event carries no
+    usable id -- an older event without the field, or a run-level event whose
+    ``thread_id`` is explicitly null. No id is ever invented for an event that
+    has one.
+    """
+
+    thread_id = event.get("thread_id")
+
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+
+    return DEFAULT_THREAD_ID
+
+
 def extract_trace(events: list) -> list:
     """Turn raw TrueForge turn events into an ordered investigation journey.
 
     Nothing here is synthesised: every entry comes from an event TrueForge
-    actually recorded. Tool calls are read from ``model.message.tool_calls``
-    and paired with their ``tool.response`` by ``tool_call_id``.
+    actually recorded.
+
+    Tool calls are read from ``model.message.tool_calls`` and paired with
+    their ``tool.response`` by **(thread_id, tool_call_id)**, never by
+    ``tool_call_id`` alone. Once more than one thread can run in a turn, the
+    id is no longer unique: it is minted per conversation by the model
+    provider (observed values are short counters like ``call_2394998``), so
+    two threads can independently produce the same one. Pairing on the id
+    alone would attach a subagent's result to the parent's tool call. The
+    thread is what makes the identity unique; the id is kept exactly as
+    TrueForge recorded it.
     """
 
     trace = []
@@ -162,6 +195,7 @@ def extract_trace(events: list) -> list:
             event = event["event"]
 
         kind = event.get("type")
+        thread_id = _thread_of(event)
 
         if kind == "mcp.initialize":
             for info in event.get("mcp_servers", []):
@@ -169,6 +203,7 @@ def extract_trace(events: list) -> list:
                     "step": "mcp.initialize",
                     "server": info.get("name"),
                     "transport": info.get("transport_type"),
+                    "thread_id": thread_id,
                     "created_at": event.get("created_at"),
                 })
 
@@ -181,6 +216,7 @@ def extract_trace(events: list) -> list:
                     "step": "tool.call",
                     "tool": function.get("name"),
                     "arguments": _parse_arguments(function.get("arguments")),
+                    "thread_id": thread_id,
                     "tool_call_id": call_id,
                     "created_at": event.get("created_at"),
                 }
@@ -188,7 +224,7 @@ def extract_trace(events: list) -> list:
                 trace.append(entry)
 
                 if call_id:
-                    pending[call_id] = entry
+                    pending[(thread_id, call_id)] = entry
 
             content = event.get("content")
 
@@ -196,16 +232,18 @@ def extract_trace(events: list) -> list:
                 trace.append({
                     "step": "model.message",
                     "content": content,
+                    "thread_id": thread_id,
                     "created_at": event.get("created_at"),
                 })
 
         elif kind == "tool.response":
             call_id = event.get("tool_call_id")
-            call = pending.get(call_id, {})
+            call = pending.get((thread_id, call_id), {})
 
             trace.append({
                 "step": "tool.response",
                 "tool": call.get("tool"),
+                "thread_id": thread_id,
                 "tool_call_id": call_id,
                 "content": event.get("content"),
                 "created_at": event.get("created_at"),
@@ -215,9 +253,34 @@ def extract_trace(events: list) -> list:
             for call in event.get("tool_calls") or []:
                 trace.append({
                     "step": "tool.approval_required",
+                    "thread_id": thread_id,
                     "tool_call_id": call.get("id"),
                     "created_at": event.get("created_at"),
                 })
+
+        elif kind == "thread.created":
+            parent = event.get("parent") or {}
+            agent_info = event.get("agent_info") or {}
+
+            trace.append({
+                "step": "thread.created",
+                "thread_id": event.get("thread_id"),
+                "name": agent_info.get("name"),
+                "parent_thread_id": parent.get("thread_id"),
+                "parent_tool_call_id": parent.get("tool_call_id"),
+                "created_at": event.get("created_at"),
+            })
+
+        elif kind == "thread.done":
+            parent = event.get("parent") or {}
+
+            trace.append({
+                "step": "thread.done",
+                "thread_id": event.get("thread_id"),
+                "parent_thread_id": parent.get("thread_id"),
+                "parent_tool_call_id": parent.get("tool_call_id"),
+                "created_at": event.get("created_at"),
+            })
 
         elif kind == "turn.done":
             state = event.get("state", {})
@@ -227,6 +290,9 @@ def extract_trace(events: list) -> list:
                 "status": state.get("status"),
                 "created_at": event.get("created_at"),
             })
+
+        # Any other event type is ignored. New TrueForge event types must
+        # never break an investigation trace.
 
     return trace
 
@@ -274,8 +340,16 @@ def pending_approvals(turn: dict, trace: list) -> list:
     """
 
     state = turn.get("state", {})
+
+    # Keyed by (thread_id, tool_call_id) for the same reason extract_trace
+    # pairs on it: with more than one thread the id alone is ambiguous, and
+    # resolving it wrongly would show the operator the arguments of a
+    # different call than the one they are being asked to approve.
     calls_by_id = {
-        entry.get("tool_call_id"): entry
+        (
+            entry.get("thread_id", DEFAULT_THREAD_ID),
+            entry.get("tool_call_id"),
+        ): entry
         for entry in trace
         if entry.get("step") == "tool.call"
     }
@@ -286,11 +360,11 @@ def pending_approvals(turn: dict, trace: list) -> list:
         if action.get("type") != "tool.approval_required":
             continue
 
-        thread_id = action.get("thread_id", "main")
+        thread_id = action.get("thread_id", DEFAULT_THREAD_ID)
 
         for call in action.get("tool_calls") or []:
             call_id = call.get("id")
-            requested = calls_by_id.get(call_id, {})
+            requested = calls_by_id.get((thread_id, call_id), {})
 
             pending.append({
                 "thread_id": thread_id,
