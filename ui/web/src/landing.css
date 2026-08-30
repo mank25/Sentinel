@@ -257,7 +257,7 @@
 
 .engine-strip-max { color: var(--dim); font-family: var(--mono); font-size: 13px; }
 
-.engine-strip-meta { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.engine-strip-meta { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
 
 .engine-strip-note { color: var(--dim); font-size: 11.5px; }
 .engine-strip-note code { font-family: var(--mono); color: var(--muted); }
@@ -485,6 +485,7 @@
   border-top: 1px solid var(--line-soft);
 }
 
+.run p code { font-family: var(--mono); color: var(--text); }
 .run p { margin: 0 0 26px; color: var(--muted); font-size: 14.5px; line-height: 1.72; max-width: 46ch; }
 
 .terminal {

@@ -356,7 +356,8 @@ export function Landing({ onEnter }: { onEnter: () => void }) {
           <p>
             The console ships pre-built, so a real run needs Python alone. It
             resets the seeded incident first, so approve and deny are both
-            watchable in one sitting.
+            watchable in one sitting. The evidence database holds one account,{" "}
+            <code>admin</code> — that is the incident to investigate.
           </p>
           <button className="btn-primary" onClick={onEnter}>
             Open the console

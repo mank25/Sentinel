@@ -48,7 +48,7 @@ export function ApprovalGate({
     <section className="gate" role="alertdialog" aria-live="assertive">
       <header className="gate-head">
         <span className="dot wait" />
-        Action requires approval
+        <span className="gate-head-title">Authorisation required</span>
         <span className="gate-head-note">
           The investigation is paused. Nothing runs until you decide.
         </span>
@@ -165,7 +165,7 @@ export function ApprovalGate({
             onClick={() => onDecide(true, reason)}
             disabled={busy || !gateId}
           >
-            Approve action
+            Authorise action
           </button>
         </div>
 
