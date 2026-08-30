@@ -1,517 +1,590 @@
 # Sentinel
 
-AI Security Investigator — an MCP server exposing read-only security
-investigation tools over a local SQLite event store.
+### Autonomous security investigation on TrueForge — with the dangerous half under human control.
 
-## Setup
+Sentinel investigates a possibly-compromised account the way a SOC analyst
+does. A TrueForge agent decides what evidence to gather and pulls it through
+read-only MCP tools, a deterministic engine — not the model — computes the
+risk score, and when the agent wants to contain the account **TrueForge stops
+it and waits for a person.**
+
+> **The agent investigates. The engine scores. The human authorises.**
+
+The gate is not a paragraph in a prompt. `contain_account` and `block_ip` are
+annotated `destructiveHint: true` on the MCP server, the agent spec sets
+`require_approval_for_tools: ["@write", "@destructive"]`, and TrueForge pauses
+the turn and emits `tool.approval_required`. **Rewriting the system prompt
+cannot bypass it.** The model proposes; a person decides.
+
+---
+
+## Quick start
+
+Three services, one command.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+python data/init_db.py                       # seed the incident
+
+# terminal 1 — TrueForge v0.1.4 on :8790, with a model provider configured
+# terminal 2
+python mcp/sentinel_mcp/http_server.py       # Sentinel MCP tools on :8791
+
+# terminal 3 — the demo
+python -m sentinel.demo
 ```
 
-Dependencies are declared in `pyproject.toml`.
+`python -m sentinel.demo` resets the demo state, checks every service is
+ready, runs a real investigation, streams the agent's tool calls as TrueForge
+records them, **stops for your decision**, executes containment if you
+approve, verifies it, and prints the incident report.
 
-## Database initialization
+Not ready yet? It tells you what to type:
 
-The demo security database (`data/security.db`) is **not** committed to Git.
-`data/init_db.py` is the source of truth for it — recreate it after a fresh
-clone with:
+```
+Sentinel readiness
+  [OK  ] Evidence DB       READY      1 user(s), 51 login events, 2 network records, read-only
+  [FAIL] MCP server        NOT READY  running, but missing get_ip_status
+                           -> It is serving an older build. Restart it: python mcp/sentinel_mcp/http_server.py
+  [OK  ] TrueForge         READY      v0.1.4 API at http://localhost:8790
+  [OK  ] Model             READY      google-gemini/gemini-3-6-flash
+```
+
+Run it repeatedly. `--approve`, `--deny` and `--delegate` script the paths;
+`--check` runs readiness alone; `--reset-only` puts the demo back to its
+starting position. Every run resets first, so approve and deny are both
+watchable in one sitting.
+
+### The browser console
 
 ```bash
-python data/init_db.py
+python -m ui.server          # http://127.0.0.1:8792
 ```
 
-Importing `data.init_db` has no side effects; the database is only created when
-the script is run directly or `init_db()` is called explicitly.
+That is the whole setup — `ui/web/dist` is committed, so the console runs
+with Python alone. npm is needed to *change* the frontend, not to run it.
 
-## Running the MCP server
+---
 
-```bash
-python mcp/sentinel_mcp/server.py
-```
-
-The server speaks MCP over stdio and exposes two read-only tools:
-
-- `get_login_history(username)` — returns the user's profile and their most
-  recent login events (newest first, with ISO-8601 timestamps).
-- `get_network_activity(ip_address)` — returns network intelligence for a
-  single IP address.
-- `assess_user_risk(username)` — runs the deterministic pipeline (analyzer →
-  risk engine → report) and returns the authoritative threat level, risk
-  score and risk factors. Scoring stays in `investigator/risk.py`; this tool
-  is a thin read-only adapter over it.
-
-All three are annotated `readOnlyHint: true`. The same tools are also served
-over streamable HTTP for TrueForge — see the TrueForge section below:
-
-```bash
-python mcp/sentinel_mcp/http_server.py
-```
-
-The HTTP transport is **authenticated**. stdio needs no credentials (the
-client spawns the process), but a listening socket serving login histories
-and network intelligence does, so every request must carry
-`Authorization: Bearer <token>`. The token comes from `$SENTINEL_MCP_TOKEN`,
-or is generated once into `.sentinel-mcp-token` (mode 0600, gitignored). The
-server also refuses to bind to a non-loopback interface unless
-`SENTINEL_MCP_ALLOW_REMOTE=1` is set.
-
-`get_network_activity` distinguishes two negative outcomes, and the
-investigator keeps them apart:
-
-```json
-{"found": false, "ip_address": "203.0.113.9"}
-{"found": false, "ip_address": "203.0.113.9", "error": "Unable to read network security data."}
-```
-
-The first means the IP was queried and has no record. The second means the
-lookup itself failed — the investigation then reports incomplete network
-evidence rather than treating the IP as clean.
-
-The database is opened strictly read-only (`mode=ro` + `PRAGMA query_only`), so
-the tool can never create or modify `data/security.db`. If the database is
-missing or invalid, the tool returns a structured error rather than raising:
-
-```json
-{"found": false, "error": "Security database is unavailable or invalid"}
-```
-
-## Smoke test
-
-```bash
-python mcp/test_client.py
-```
-
-This starts the server, lists its tools, and calls
-`get_login_history("admin")`.
-
-## Running an investigation
-
-Both invocations are supported and behave identically:
-
-```bash
-python -m investigator.run_investigation   # preferred
-python investigator/run_investigation.py
-```
-
-The pipeline keeps its layers separate:
+## Architecture
 
 ```
-MCP tools (read-only)  ->  analyzer (correlation)  ->  risk engine (scoring)  ->  report (wording)
-```
-
-The risk engine is deterministic — every point is attributable to a listed
-factor — and the report never recalculates risk.
-
-## Tests
-
-The suites are plain functions, so they run either way:
-
-```bash
-pytest -q     # investigator + trueforge unit tests
-
-# or, without pytest installed:
-python -m investigator.test_analyzer
-python -m investigator.test_risk
-python -m investigator.test_report
-python -m investigator.test_run_investigation
-```
-
-## TrueForge agent integration
-
-### Architecture
-
-```
-                        TrueForge  (agent loop, model, MCP orchestration)
-                             |
-                      Sentinel Agent
-                             |
-              +--------------+--------------+
-              v              v              v
-     get_login_history  get_network_activity  assess_user_risk
-              |              |              |
-              +--------------+--------------+
-                             v
-                     Sentinel MCP server  (read-only SQLite)
-                             v
-                          Analyzer      <- correlates evidence
-                             v
-                         Risk Engine    <- deterministic scoring
-                             v
-                           Report
-                             v
-                      Agent response
+                            ┌──────────────────────────────┐
+                            │          TRUEFORGE           │
+                            │  agent loop · MCP orchestra- │
+     "Investigate admin"  → │  tion · execution trace ·    │
+                            │  threads · APPROVAL GATES    │
+                            └───────────────┬──────────────┘
+                                            │
+                        ┌───────────────────┴──────────────────┐
+                        ▼                                      ▼
+              ┌──────────────────┐                  ┌────────────────────┐
+              │  SENTINEL AGENT  │                  │  SPECIALISTS       │
+              │  chooses what to │  create_sub_     │  identity/timeline │
+              │  investigate     │  agent ────────► │  /network          │
+              └────────┬─────────┘   (--delegate)   │  own threads       │
+                       │                            └─────────┬──────────┘
+                       └──────────────┬───────────────────────┘
+                                      ▼
+                    ┌─────────────────────────────────────┐
+                    │      SENTINEL MCP SERVER            │
+                    │                                     │
+                    │  READ-ONLY          DESTRUCTIVE     │
+                    │  get_login_history  contain_account │
+                    │  get_network_activ. block_ip        │
+                    │  assess_user_risk   ── gated ──     │
+                    │  get_account_status                 │
+                    │  get_ip_status                      │
+                    └────────┬──────────────────┬─────────┘
+                             ▼                  ▼
+                 ┌───────────────────┐  ┌──────────────────┐
+                 │  data/security.db │  │ containment.db   │
+                 │  mode=ro          │  │ append-only      │
+                 │  PRAGMA query_only│  │ audit log        │
+                 │  NEVER WRITTEN    │  │ the only writes  │
+                 └─────────┬─────────┘  └──────────────────┘
+                           ▼
+                 ┌───────────────────┐
+                 │   RISK ENGINE     │  investigator/risk.py
+                 │   DETERMINISTIC   │  every point attributable
+                 └───────────────────┘  no LLM, ever
 ```
 
 Who does what:
 
-- **TrueForge** runs the agent loop: it holds the model, decides which tool to
-  call next, executes MCP tool calls and records every event. It is the
-  orchestrator, and it does no security scoring.
-- **MCP tools** are the evidence layer. They are strictly read-only
-  (`mode=ro` + `PRAGMA query_only`) and annotated `readOnlyHint: true`.
-- **Analyzer / risk engine / report** stay deterministic and unchanged. The
-  agent reaches them through the `assess_user_risk` tool, so the threat level
-  and risk score are computed by `investigator/risk.py` and never invented by
-  the model. The prompt in `investigator/prompts.py` contains no scoring
-  rules for exactly this reason.
+| Layer | Responsibility | Never does |
+|---|---|---|
+| **TrueForge** | agent loop, model, MCP orchestration, event trace, threads, approval gates | security scoring |
+| **The agent (LLM)** | decides what to investigate, correlates, explains, *proposes* containment | invent a score, execute containment |
+| **MCP evidence tools** | read the evidence store | write anything |
+| **Analyzer** | correlate evidence deterministically | call a model |
+| **Risk engine** | the authoritative score | get overridden |
+| **The human** | authorise destructive actions | get bypassed |
 
-`trueforge/` is the only package that speaks HTTP to TrueForge. The
-deterministic modules never import it.
+---
 
-### Why the MCP server also speaks HTTP
+## Why TrueForge
 
-TrueForge v0.1.4 accepts **remote MCP servers only** -- its `MCPServerType`
-enum has the single value `"remote"` and the manifest requires a `url`. The
-stdio entrypoint therefore cannot be registered with it. `http_server.py`
-serves the *same* `server` object over streamable HTTP; the tools and the
-read-only model are identical.
+Sentinel does not use TrueForge as an HTTP wrapper around an LLM. The
+investigation *runs inside the harness*, and six harness capabilities are
+load-bearing:
 
-### Setup
+| Capability | How Sentinel depends on it |
+|---|---|
+| **Agent execution** | `AgentSpec` with instructions, model, iteration ceiling. The agent loop is TrueForge's, not a hand-rolled `while` loop. |
+| **MCP orchestration** | TrueForge connects to the Sentinel MCP server, discovers tools, and executes every tool call. Sentinel never calls its own tools during an investigation. |
+| **Human approval gates** | `require_approval_for_tools` + destructive annotations. TrueForge *pauses the turn* and emits `tool.approval_required`; nothing runs until a `user.tool_approval` decision comes back. **This is the project's central safety property, and it is the harness's.** |
+| **Execution traces** | `mcp.initialize`, `model.message`, `tool.response`, `thread.created`, `turn.done` — real recorded events. The timeline and the CLI narration are both projections of them. Nothing is synthesised. |
+| **Session & turn lifecycle** | An investigation is a session; a pause-and-resume is a new turn with `previous_turn_id`. Trace correlation spans turns because a `tool.response` in the resumed turn belongs to a `tool.call` from the paused one. |
+| **Thread-aware execution / subagents** | `create_sub_agent` puts each specialist on its own thread. This is why results correlate on `(thread_id, tool_call_id)` — see below. |
 
-1. Start TrueForge (v0.1.4) on `http://localhost:8790` and configure a model
-   provider under **Settings -> Model Providers**. Sentinel never reads a
-   provider API key -- TrueForge stores it. Do not put one in this repo.
+**Not used, and why:** sandbox execution. TrueForge v0.1.4 sandboxes are
+Daytona-backed, and this deployment has no sandbox provider configured
+(`GET /api/v1/settings/sandbox-providers` → *"No sandbox provider
+configured"*). Enabling `config.sandbox` would fail the turn rather than add
+a capability, so it stays off with the reason recorded in
+`build_agent_spec`. A capability we cannot actually run is not one we claim.
 
-2. Start the Sentinel MCP server over HTTP:
+---
 
-   ```bash
-   python mcp/sentinel_mcp/http_server.py
-   # Sentinel MCP (streamable-http) listening on http://127.0.0.1:8791/mcp
-   ```
+## The safety model
 
-3. Run an investigation. Registration and agent creation happen
-   programmatically -- no browser configuration required:
+```
+                              SENTINEL
 
-   ```bash
-   python -m trueforge.run_agent --username admin --trace
-   ```
+                   ┌──────────────────────────┐
+                   │          AGENT           │
+                   │  investigate · correlate │
+                   │  reason · propose        │
+                   └────────────┬─────────────┘
+                                ▼
+                   ┌──────────────────────────┐
+                   │      MCP EVIDENCE        │
+                   │        READ ONLY         │
+                   │  mode=ro + query_only    │
+                   └────────────┬─────────────┘
+                                ▼
+                   ┌──────────────────────────┐
+                   │       RISK ENGINE        │
+                   │      DETERMINISTIC       │
+                   │   investigator/risk.py   │
+                   └────────────┬─────────────┘
+                                ▼
+                   ┌──────────────────────────┐
+                   │     HUMAN APPROVAL       │
+                   │     TRUEFORGE GATE       │
+                   └────────────┬─────────────┘
+                                ▼
+                   ┌──────────────────────────┐
+                   │       CONTAINMENT        │
+                   │       WRITE PATH         │
+                   └────────────┬─────────────┘
+                                ▼
+                   ┌──────────────────────────┐
+                   │   VERIFY BY READ-BACK    │
+                   │  get_account_status /    │
+                   │  get_ip_status           │
+                   └──────────────────────────┘
+```
 
-Configuration is environment-driven; see `.env.example`. Everything has a
-working local default.
+### The gate is enforced by the harness, not the prompt
 
-### What the runner does
+Four independent properties, each with tests behind it:
 
-1. `GET /api/v1/capabilities` - confirm TrueForge is up
-2. `PUT /api/v1/settings/mcp-servers` - register `sentinel-security`
-   (create-or-replace, so it is idempotent)
-3. `GET /api/v1/mcp-servers/{name}/tools` - make TrueForge connect to the MCP
-   server and confirm all three tools load
-4. `GET /api/v1/agents` + `POST`/`PUT /api/v1/agents/{id}` - create or update
-   the `sentinel-investigator` agent
-5. `POST /api/v1/sessions` - open a session against the agent
-6. `POST /api/v1/sessions/{id}/turns` - send the investigation request
-7. `GET /api/v1/sessions/{id}/turns/{turn_id}` - poll until the turn ends
-8. `GET /api/v1/sessions/{id}/turns/{turn_id}/events` - collect the real
-   execution trace
-
-### Containment and the approval gate
-
-Sentinel's evidence tools only read. Containment is the one write path, and
-it is gated on a human.
-
-Two stores, one direction each:
+**1. Evidence is unwritable.** `data/security.db` is opened `mode=ro` with
+`PRAGMA query_only`. Containment writes to a *different* database. An
+investigation can never modify the evidence it reasons about.
 
 | Store | Opened | Written by |
 |---|---|---|
 | `data/security.db` | `mode=ro` + `PRAGMA query_only` | nothing, ever |
 | `data/containment.db` | read-write | `investigator/containment.py` only |
 
-An investigation can therefore never modify the evidence it reasons about.
+**2. The score is not the model's.** Risk points live in
+`investigator/risk.py` and reach the agent only through `assess_user_risk`.
+The prompt contains no scoring rules — and `investigator/test_prompts.py`
+fails the build if a point value, a `score >=` construct or a threshold ever
+appears in it. The console republishes the engine's numbers verbatim from the
+tool result; no scoring logic is duplicated in TypeScript.
 
-**The gate is enforced by the harness, not the prompt.** `contain_account`
-and `block_ip` are annotated `readOnlyHint: false, destructiveHint: true` on
-the MCP server, and the agent spec sets
-`require_approval_for_tools: ["@write", "@destructive"]`. TrueForge pauses the
-turn and emits `tool.approval_required`; nothing runs until a
-`user.tool_approval` decision comes back. Rewriting the system prompt cannot
-bypass this — the model proposes, a person decides.
+**3. Destructive tools stop the harness.** Annotated `destructiveHint: true`;
+the agent spec requires approval for `@write` and `@destructive`. Approval is
+attached to the *tool*, not the calling thread — so a subagent invoking
+`block_ip` is paused exactly as the lead is.
 
-Containment writes are observable: `get_account_status` reads the audit log
-back, so a later investigation sees that a response action was taken and why.
-
-Running it:
-
-```bash
-python -m trueforge.run_agent --username admin --trace   # prompts you to decide
-python -m trueforge.run_agent --username admin --approve # scripted demo: approve
-python -m trueforge.run_agent --username admin --deny    # scripted demo: deny
-```
-
-Interactively the run stops and shows what is being requested:
-
-```
-====================================================================
-  CONTAINMENT APPROVAL REQUIRED
-====================================================================
-  action:  contain_account
-  target:  username='admin'
-  reason:  47 failed logins then a success from 185.123.45.67
-====================================================================
-  Approve this action? [y/N]
-```
-
-An empty answer, or a closed stdin, is a **denial** — silence is never
-consent. On denial the decision is final: the agent reports that the action
-was not taken and may not retry it.
-
-### The investigator prompt
-
-`investigator/prompts.py` is the agent's behaviour specification, and it is
-tested like one (`investigator/test_prompts.py`). It is what makes the agent
-an investigator rather than a wrapper around one function.
-
-It contains, deliberately:
-
-- **A role and a standard.** Sentinel is a SOC analyst whose credibility
-  rests on every claim tracing back to a tool result.
-- **Purpose, not just names, for each tool** — why `get_login_history` is
-  always first (it establishes the *baseline* device and location everything
-  else is judged against), why `get_network_activity` exists (to corroborate
-  or *refute* a suspicion the login history alone cannot settle), and that
-  `assess_user_risk` is the scoring system of record.
-- **A method with an explicit correlation stage.** Findings must be tied
-  together across tools before any conclusion; a finding backed by two
-  independent sources is called out as stronger than one backed by a single
-  source. A reconcile step requires the agent to state any disagreement
-  between its own reading and the engine's factors.
-- **Derivation, not memorisation.** Suspicious IPs must come from the login
-  evidence just read. The prompt contains no IP address at all — a test
-  enforces that, because a literal IP would let the agent "investigate" the
-  seeded scenario without reading anything.
-- **Calibration.** Each threat level licenses a specific strength of claim.
-  Only CRITICAL may centre on likely compromise, and even there the wording
-  is "consistent with", never "the account was compromised". HIGH and MEDIUM
-  explicitly may not assert compromise; LOW with no factors must not
-  manufacture concern.
-
-It deliberately contains **no scoring rules**. Two tests enforce that: one
-bans point values and `score +=`-style text, another matches
-threshold-shaped constructs (`score >= 80`, `critical: 80`) so the model can
-never derive a score itself. The engine scores; the agent investigates.
-
-### Execution trace
-
-`--trace` prints the investigation journey, built from the events TrueForge
-actually recorded (`mcp.initialize`, tool calls on `model.message.tool_calls`,
-results on `tool.response`, paired by `tool_call_id`). Nothing is synthesised.
-`--json` emits the full result including raw events, which is what a UI would
-consume later.
-
-### Model choice
-
-The default is `google-gemini/gemini-3-6-flash`, verified end-to-end against
-the seeded scenario. Override with `--model` or `$TRUEFORGE_MODEL`; the
-runner validates the model against `GET /api/v1/models` before starting a
-session and lists the alternatives if it is missing.
-
-Two requirements: **tool/function calling**, and enough context for a full
-login history (~1,900 tokens for the seeded `admin` account).
-
-**Known-incompatible: `groq/gpt-oss-120b`.** A tool-using turn fails on the
-second model call:
-
-```
-'messages.2' : for 'role:assistant' the following must be satisfied
-[('messages.2' : property 'reasoning_content' is unsupported)]
-```
-
-TrueForge v0.1.4 persists the model's reasoning as `thinking_blocks` and
-replays it to the provider as `reasoning_content`; Groq's OpenAI-compatible
-API rejects that property on input. Nothing in Sentinel triggers it — MCP
-registration, tool discovery and the first tool call all succeed first. It is
-specific to reasoning models on providers that reject the field; Gemini,
-OpenAI and Anthropic all accept it. `ModelParams` documents extra keys as
-"forwarded as-is", but v0.1.4 drops unknown keys, so `reasoning_format`
-cannot be used to work around it.
-
-The deterministic investigation always runs without any LLM:
-
-```bash
-python -m investigator.run_investigation
-```
-
-### Tests
-
-```bash
-pytest -q                 # unit tests only; no server required
-pytest -m integration -q  # needs TrueForge + the Sentinel MCP server running
-```
-
-The console's event-to-timeline transformation -- tool correlation, replay
-idempotence, the approval record -- is a pure function in
-`ui/web/src/correlate.ts`, tested without a browser and without adding a test
-framework (Node's own runner and native TypeScript stripping):
-
-```bash
-cd ui/web && npm test
-```
-
-Integration tests skip **only** when a prerequisite is genuinely absent —
-TrueForge not running, the MCP server not running, or the configured model
-not registered. Once those are present nothing skips: a broken registration,
-provisioning failure or tool-orchestration regression fails the suite. The
-sole concession is a bounded retry for transient provider outages (503 /
-rate limiting), which retries and then fails.
-
-## Operator console
-
-The console is where the approval gate becomes visible. A trace scrolling past
-in a terminal does not show an operator what the agent wants to do to a
-production account; a button next to the account name does.
-
-```bash
-python -m ui.server          # http://127.0.0.1:8792
-```
-
-That is the whole setup. `ui/web/dist` is committed, so the console runs with
-Python alone -- npm is needed to *change* the frontend, not to run it.
-
-What it shows:
-
-- **What the agent is doing, while it does it** -- provisioning, then each
-  MCP tool call TrueForge actually made, with its arguments and its result,
-  streamed as TrueForge records it. The agent's turn is polled once a second
-  and the events recorded so far are re-read, so a tool call reaches the
-  console about a second after it happens rather than at the end of the run.
-  Nothing is synthesised: every row comes from an event TrueForge recorded.
-- **What it is waiting on** -- when TrueForge pauses the turn, the console
-  renders the exact containment call, its arguments, and what it will do in
-  plain words. Approve and Deny are the only ways forward.
-- **What it decided, and who decided it** -- the deterministic risk engine's
-  score and threat level are shown next to, and visibly apart from, the
-  agent's narrative. See "The verdict is the engine's" below.
-
-The console holds no security logic. It starts investigations, streams what
-TrueForge reports, and carries a decision back to the paused turn. Scoring
-stays in `investigator/risk.py`; the gate stays in the harness.
-
-### An approval answers one specific request
-
-A decision names the gate it answers.
-
-Every pause mints a `gate_id`. It rides out on the `approval_required` event,
-the browser sends it back with the decision, and the server refuses anything
-that does not match the gate currently open:
+**4. A decision answers one specific request.** Every pause mints a
+`gate_id`. It rides out on the event, comes back with the decision, and the
+server refuses anything that does not name the gate currently open:
 
 ```
 POST /api/investigations/{id}/decision
 {"gate_id": "a358cc9a...", "allowed": false, "reason": "Shared VPN."}
 
-400  gate_id missing or not a string
-409  gate_id names a gate that is not the open one   -> nothing executes
-409  no gate is open at all                          -> nothing executes
+400  'allowed' is not a JSON boolean            -> nothing executes
+400  gate_id missing                            -> nothing executes
+409  gate_id names a gate that is not the open one
+409  no gate is open at all
 ```
 
-This is not ceremony. Without it, a decision means "approve whatever gate
-happens to be open right now" -- so a duplicated click, a second browser tab,
-or a retried request could approve the *next* containment action, which the
-operator never saw. An investigation can pause more than once, and the two
-pauses can propose very different things. `test_a_gate1_decision_cannot_approve_gate2`
-in `ui/test_console.py` holds that line.
+Without it, a decision would mean *"approve whatever gate happens to be open
+right now"* — so a duplicated click, a second tab or a retried request could
+approve the **next** containment action, which the operator never saw. An
+investigation can pause more than once, and the two pauses can propose very
+different things.
 
-### The verdict is the engine's
+**Silence is never consent.** An empty answer, a closed stdin, or ten minutes
+of no decision are all denials. The failure mode is "nothing happened", never
+"it went ahead".
 
-The console never reads a threat level out of the model's prose.
+### What containment actually does
 
-`assess_user_risk` is the deterministic engine's MCP tool. When its result
-comes back on the event stream, `ui/runner.py` parses it and republishes the
-score, threat level and risk factors as a structured `assessment` event --
-verbatim, with no recomputation, and dropped entirely rather than guessed at
-if the payload is not a completed assessment. The console renders that beside
-the agent's narrative, labelled, so the split is legible at a glance:
+Approving records an **authorised containment order** in
+`data/containment.db`, which is Sentinel's system of record for response
+actions. It does not itself call an identity provider or program a firewall —
+a production deployment puts provider adapters behind that same approved
+interface. This is stated in the tool descriptions, on the approval card and
+here, because an agent that overstates what it did is the failure this
+project exists to prevent. Qodo raised exactly this on
+[#5](https://github.com/mank25/Sentinel/pull/5); the fix was honesty, not
+scope.
+
+What *is* real: the authorisation, the audit record, and the read-back.
+
+---
+
+## The demo scenario
+
+One coherent incident, seeded by `data/init_db.py`. Run
+`python data/init_db.py --narrative` to read the story the rows describe.
 
 ```
-DETERMINISTIC RISK ENGINE          AI INVESTIGATOR
-100 / 100  CRITICAL                narrative, evidence, assessment
-6 evidence-backed factors
-Computed by investigator/risk.py
+2026-08-24 09:21   admin signs in from Delhi on their MacBook       ─┐
+2026-08-24 14:02   routine sign-in                                   ├ baseline
+2026-08-25 09:47   routine sign-in                                  ─┘
+
+2026-08-26 02:11   41 password failures from 185.123.45.67           ← brute force
+                   mfa_status: not_reached (MFA never challenged)
+2026-08-26 02:21   6 attempts clear the password, denied at MFA      ← credentials
+                   mfa_status: failed                                  compromised
+2026-08-26 02:24   the 7th push is approved. Success.                ← MFA fatigue
+                   Unknown device, unknown location.
+
+network intel      185.123.45.67  suspicious · not known · 58 conns
+                   10.10.1.20     clean · India · known
 ```
 
-No scoring logic is duplicated in TypeScript. There is one scorer, and it is
-`investigator/risk.py`.
+Two details that matter:
 
-### Architecture
+- **The corporate egress is recorded as clean.** Corroboration is only
+  meaningful if a lookup could have come back the other way. An investigator
+  who checks both IPs learns that one is suspicious and one is not.
+- **The attacker IP appears in the evidence and nowhere else.** Not in the
+  prompt, not in the risk engine, not in the UI. A test fails the build if an
+  IP literal ever reaches the prompt, because an agent handed the answer is
+  not investigating.
+
+The engine's verdict on this data: **CRITICAL, 100/100**, from eight
+evidence-backed factors. It is computed, not chosen.
+
+### What the agent actually does with it
+
+An unscripted run (the tool order is the model's, not a fixed pipeline):
 
 ```
-Browser (React)
-    |  POST /api/investigations        start
-    |  GET  .../events                 SSE: the run as it happens
-    |  POST .../decision               allow / deny
-    v
-ui/server.py  (Starlette)
-    v
-ui/runner.py     -- runs the investigation on a worker thread; the
-    |               on_approval callback blocks it on a threading.Event
-    v               until a human answers. Nothing is auto-approved.
-trueforge/agent.py  -> TrueForge -> Sentinel MCP tools
+→ get_login_history(username=admin)          establish the baseline
+← 51 events, normal device MacBook, Delhi
+→ get_network_activity(ip=185.123.45.67)     corroborate — IP derived from evidence
+← reputation suspicious, known false
+→ assess_user_risk(username=admin)           the authoritative verdict
+← CRITICAL 100/100, 8 factors
+→ get_account_status(username=admin)         is it already contained?
+← contained: false
+→ get_ip_status(ip=185.123.45.67)
+← blocked: false
+→ contain_account(...)
+⚠ PAUSED — human approval required
+                                             ← operator decides
+→ get_account_status(username=admin)         verify by read-back
+← contained: true
+
+VERIFICATION: CONFIRMED
 ```
 
-If the operator never answers, the run stays paused until it times out
-(`ui.runner.APPROVAL_TIMEOUT`, 10 minutes) and containment does **not**
-execute. The failure mode is "nothing happened", never "it went ahead".
-An investigation may pause more than once; each gate waits for its own
-decision, so an earlier answer can never release a containment call the
-operator has not seen.
+---
+
+## Delegated investigation
+
+`--delegate` runs the same investigation as a lead analyst commissioning
+three specialists, each on its own TrueForge thread:
+
+```
+                      SENTINEL LEAD  (thread: main)
+                             │  create_sub_agent
+          ┌──────────────────┼──────────────────┐
+          ▼                  ▼                  ▼
+      IDENTITY           TIMELINE            NETWORK
+      ANALYST            ANALYST             ANALYST
+   login history      chronology,        reputation for the
+   baseline, which    failure→success    IPs identity found
+   IPs carry signal   sequencing         (it cannot see logins)
+          └──────────────────┼──────────────────┘
+                             ▼
+                   CORRELATION (the lead)
+                             ▼
+                       RISK ENGINE
+                             ▼
+                     HUMAN APPROVAL
+                             ▼
+                  CONTAINMENT → VERIFY
+```
+
+**Off by default, deliberately.** Delegation multiplies the model calls a run
+needs; a probe against this deployment had the provider rate-limit a
+delegated run partway through. Reliability is the default path; delegation is
+the capability demo.
+
+**It changes who gathers evidence and nothing else.** Specialists get the
+same tool set and the same gate. The brief tells them not to propose
+containment — that keeps the investigation coherent, and it is explicitly
+*not* what makes it safe. A test asserts the brief never claims otherwise.
+
+### Why `(thread_id, tool_call_id)` — the bug this branch is named for
+
+`tool_call_id` is minted **per conversation** by the model provider (observed
+values are short counters like `call_2394998`). Once more than one thread can
+run in a turn, two threads can independently produce the same id.
+
+Correlating a `tool.response` by `tool_call_id` alone therefore attaches a
+subagent's result to the parent's tool call — the console would show an
+operator the wrong evidence under the right question. The thread is what makes
+the identity unique.
+
+This is enforced in three places and regression-tested in all three:
+`trueforge/agent.py` (`extract_trace`, `pending_approvals`), `ui/runner.py`
+(the event stream carries `thread_id`), and `ui/web/src/correlate.ts` (the
+browser reducer). The canonical test:
+
+```
+thread A, tool_call_id call_123    response(A, call_123) → A
+thread B, tool_call_id call_123    response(B, call_123) → B     never A → B
+```
+
+---
+
+## The operator console
+
+```bash
+python -m ui.server          # http://127.0.0.1:8792
+```
+
+The console is where the gate becomes visible. A trace scrolling past in a
+terminal does not show an operator what the agent wants to do to a production
+account; a button next to the account name does.
+
+- **An incident band** carrying subject, threat level and score from the
+  moment the engine speaks — not after the decision has been made.
+- **A live timeline** of what the agent is doing while it does it. Each tool
+  call TrueForge actually made, its arguments and its result, streamed about
+  a second after it happens. In a delegated run each entry is attributed to
+  the specialist that made it. Every row comes from a recorded event.
+- **The approval card**: the action, the target, the agent's full
+  justification (never truncated — a decision made on a shortened reason is
+  not an informed decision), the engine's score, the evidence factors behind
+  it, and what approving will actually do. A request that arrives with no
+  justification says so, and says that is itself a reason to deny.
+- **The verdict, in two halves.** The engine's score and factors, visibly
+  apart from the agent's narrative, labelled `Computed by
+  investigator/risk.py — not by the model`.
+
+The console holds no security logic. It starts investigations, streams what
+TrueForge reports, and carries a decision back to a paused turn.
 
 Every event carries a monotonic `seq`, and a follower is replayed the whole
-run from its first event. That makes reconnection trivial and safe: the
+run from its first event. Reconnection is therefore trivial and safe: the
 browser retries with backoff, replays, and the reducer drops anything at or
-below the highest `seq` it has already rendered. No duplicates, no gaps,
-order preserved -- and no second event-stream architecture to maintain.
+below the highest `seq` it has already rendered. No duplicates, no gaps, and
+no second event-stream architecture to maintain.
 
 ### Binding beyond this machine
 
-Every route can start an investigation, read its evidence trace, or approve
-containment of a production account. On `127.0.0.1` that is the operator's
-own machine. Anywhere else it is whoever can reach the port, so the console
-refuses to bind there without a shared token:
+Every route can start an investigation, read its evidence, or approve
+containment. On `127.0.0.1` that is the operator's own machine; anywhere else
+it is whoever can reach the port, so the console refuses to bind there
+without a shared token:
 
 ```bash
 python -m ui.server --host 0.0.0.0 --token "$(openssl rand -hex 24)"
 ```
 
-The token is then required on every request, as an `Authorization: Bearer`
-header or a `?token=` query parameter -- the query string is what the SSE
-stream uses, since `EventSource` cannot set headers. Open the URL the server
-prints on startup and the console carries the token for you.
-`SENTINEL_CONSOLE_TOKEN` sets it from the environment instead of the
-command line. This is a shared secret, not per-operator identity: put it
-behind a real proxy if you need accountable, per-person access.
+The token is then required on every request, as `Authorization: Bearer` or
+`?token=` (the query string is what the SSE stream uses, since `EventSource`
+cannot set headers). This is a shared secret, not per-operator identity: put
+it behind a real proxy if you need accountable, per-person access.
 
-### Frontend development
+---
+
+## Testing
 
 ```bash
-cd ui/web
-npm install
-npm run dev      # Vite on :5173, proxies /api to the Python console
-npm run build    # refresh the committed dist/
+pytest -q                 # 280 unit tests, no services required
+pytest -m integration -q  # 9 more; needs TrueForge + the MCP server running
+cd ui/web && npm test     # 24 frontend tests, no browser, no test framework
 ```
 
-### Tests
+The suites are weighted toward the failure paths, because those are the ones
+that matter here:
 
-`ui/test_console.py` drives the console with a fake agent, so it needs
-neither TrueForge nor a model. The tests that matter assert the gate holds:
-a run pauses and does not finish without a decision, a denial reason reaches
-the agent, and a decision posted outside the pause is rejected.
+| Property | Held by |
+|---|---|
+| Duplicate `tool_call_id` across threads never cross-correlates | `test_trueforge.py`, `correlate.test.ts`, `test_console.py` |
+| A gate-1 decision cannot approve gate 2 | `ui/test_console.py` |
+| A stale or replayed decision is refused (409) | `ui/test_console.py` |
+| `{"allowed": "false"}` does not approve containment | `ui/test_console.py` |
+| Denial executes nothing and is reported as not-taken | `test_trueforge.py`, `test_console.py` |
+| Silence and closed stdin are denials | `test_trueforge.py` |
+| A failed network lookup is incomplete evidence, never a clean IP | `test_analyzer.py`, `test_risk.py` |
+| A missing/corrupt database returns a structured error, not a traceback | `test_analyzer.py`, `test_demo.py` |
+| A rejected containment write reads back as not-contained | `test_containment.py` |
+| The evidence store is still unwritable | `test_containment.py` |
+| The prompt contains no IP, no score and no threshold | `test_prompts.py` |
+| Replayed events do not duplicate timeline entries | `correlate.test.ts` |
+| Non-string tool content cannot crash the timeline | `correlate.test.ts` |
 
-## Qodo Code Review Evidence
+Integration tests skip **only** when a prerequisite is genuinely absent —
+TrueForge down, MCP server down, or the model not registered. Once those are
+present nothing skips: a broken registration or a tool-orchestration
+regression fails the suite. The sole concession is a bounded retry for
+transient provider 503s.
 
-Every substantive change in Sentinel landed through a pull request reviewed by
-Qodo before merge. Nothing was pushed straight to `main`.
+---
 
-| PR | Change | Qodo raised | Outcome |
+## Model choice
+
+Default: `google-gemini/gemini-3-6-flash`, verified end-to-end. Override with
+`--model` or `$TRUEFORGE_MODEL`; the runner validates against
+`GET /api/v1/models` before opening a session and lists the alternatives if
+it is missing.
+
+Requirements: tool/function calling, and enough context for a full login
+history.
+
+**Known-incompatible: `groq/gpt-oss-120b`.** TrueForge persists the model's
+reasoning as `thinking_blocks` and replays it to the provider as
+`reasoning_content`; Groq's OpenAI-compatible API rejects that property on
+input, so the turn dies on the second model call — the moment any tool is
+used. Nothing in Sentinel triggers it; MCP registration, tool discovery and
+the first tool call all succeed first. Sentinel detects the signature and
+prints the workarounds rather than the provider's error.
+
+The deterministic investigation always runs with no LLM at all:
+
+```bash
+python -m investigator.run_investigation
+```
+
+---
+
+## Qodo code review evidence
+
+Every substantive change landed through a pull request reviewed by Qodo
+before merge. Nothing was pushed straight to `main`.
+
+### Findings, fixes, and follow-up verification
+
+| PR | Qodo finding | Severity | Outcome |
 |---|---|---|---|
-| [#2](https://github.com/mank25/Sentinel/pull/2) | Investigation tools, risk engine, reporting | Batch the suspicious-IP lookups; run per-IP lookups concurrently | **Dismissed, deliberately.** Both are throughput optimisations for a serial `get_network_activity` loop. The seeded scenario correlates a handful of IPs against a 20 KB local SQLite file, so the round-trip cost is nil and concurrency would buy nothing measurable. Kept the serial loop because the execution trace stays a readable, ordered narrative — which is the point of an investigator. Revisit if the evidence store ever moves off-box. |
-| [#3](https://github.com/mank25/Sentinel/pull/3) | TrueForge integration, HTTP MCP transport | Unify the stdio runner and the MCP adapter on one async assessment pipeline | **Partly accepted, deferred in part.** Qodo's own recommendation was to keep the transport-isolated package and synchronous adapter, and it was right: making the deterministic analyzer/risk/report layers async would add complexity to code whose entire value is being simple and predictable. The duplicated pipeline wiring it identified is real, and `investigator/assessment.py` now exists as the single composition layer the MCP tool uses. Collapsing the stdio runner onto it too is the honest remaining follow-up. |
-| [#4](https://github.com/mank25/Sentinel/pull/4) | Prompt as behaviour contract + tests | Consider enforcing tool ordering deterministically in the runtime rather than in prose | **Dismissed, with reasoning.** Enforcing the order in code would duplicate the orchestration TrueForge already owns and would make the agent a fixed script rather than an investigator. The concern behind the finding — that prose instructions are not guarantees — is instead answered by tests: `investigator/test_prompts.py` fails the build if the prompt ever contains a literal IP or a scoring rule, so the model cannot fake evidence or invent a score even if it ignores the prose. |
-| [#5](https://github.com/mank25/Sentinel/pull/5) | Containment + human approval gate | *(in review)* | The PR asks Qodo two specific questions: whether the evidence/containment two-database split is the right boundary, and whether `resume_turn_with_approval` handles a turn completing between the poll and the resume. |
+| [#5](https://github.com/mank25/Sentinel/pull/5) | *Containment never reaches target* — both destructive tools report success after only inserting an audit row | High | **Fixed by scoping the claim honestly.** The tools now describe what they do — record an authorised containment order in the system of record, with provider adapters going behind the same approved interface — and tell the agent to treat the return value as "the order was accepted", not "the account is locked". Step 8 of the prompt then requires a read-back before any success is reported, and `VERIFICATION: CONFIRMED` may not be written from the call's own return value. |
+| [#5](https://github.com/mank25/Sentinel/pull/5) | *Resumed responses lose tool* — a resumed turn's `tool.response` gets `tool: None`, breaking call/response pairing after every approval | Medium | **Fixed.** Events accumulate across every turn in an investigation and the trace is re-extracted from all of them, so a response in the resumed turn still finds the call from the paused one. `test_resumed_response_still_pairs_with_its_call`. |
+| [#6](https://github.com/mank25/Sentinel/pull/6) | *Later gates reuse approval* — after the first decision the event stayed set, so a second gate resumed with a stale decision without waiting for the operator | High | **Fixed, and it is why `gate_id` exists.** The gate, its id and the decision slot are per-pause rather than per-run. `test_a_gate1_decision_cannot_approve_gate2`. |
+| [#6](https://github.com/mank25/Sentinel/pull/6) | *String `false` approves containment* — `bool(body.get("allowed"))` reads the JSON string `"false"` as an approval | High | **Fixed.** The route requires an actual JSON boolean and returns 400 otherwise. Verified live against the running console: `{"allowed": "true"}` → 400. |
+| [#7](https://github.com/mank25/Sentinel/pull/7) | *Content blocks crash timeline* — MCP content-block results reach React as an object-containing array and take the investigation view down | High | **Fixed.** The display path coerces, and `describeResult` unwraps content blocks the way `parse_assessment` already did on the Python side. Three tests. |
+| [#7](https://github.com/mank25/Sentinel/pull/7) | *Retry budget resets forever* — `onopen` reset the counter, so open/drop cycles never exhausted the five retries | Medium | **Fixed.** The budget resets when a frame is actually delivered — the first moment the connection has demonstrably worked — not on the handshake. |
+| [#2](https://github.com/mank25/Sentinel/pull/2) | Batch / parallelise the suspicious-IP lookups | — | **Dismissed, deliberately.** Throughput optimisations for a loop that queries a 20 KB local SQLite file. The serial loop keeps the execution trace a readable, ordered narrative, which is the point of an investigator. Revisit if the evidence store moves off-box. |
+| [#3](https://github.com/mank25/Sentinel/pull/3) | Unify the stdio runner and the MCP adapter on one assessment pipeline | — | **Partly accepted.** The duplicated composition wiring was real, and `investigator/assessment.py` exists because of it. Making the deterministic layers async was declined — Qodo's own recommendation agreed — because their entire value is being simple and predictable. |
+| [#4](https://github.com/mank25/Sentinel/pull/4) | Enforce tool ordering in the runtime rather than in prose | — | **Dismissed, with reasoning.** Enforcing the order in code would duplicate orchestration TrueForge already owns and make the agent a fixed script rather than an investigator. The concern behind it — that prose is not a guarantee — is answered by tests instead: `test_prompts.py` fails the build if the prompt contains a literal IP or a scoring rule. |
 
-The pattern worth noting: Qodo's most useful findings on this repo were
-architectural rather than defect-level, and the most valuable one (#3) was the
-duplicated composition path — which is why `investigator/assessment.py` exists.
-The performance suggestions were correct in general and wrong for this
-workload, which is the kind of call the review is there to prompt rather than
-to make.
+Qodo's architectural recommendations on #5, #6 and #7 all endorsed the
+existing design (keep the two-database split and the harness gate; keep the
+worker-thread bridge and SSE; keep sequenced full-replay over
+`Last-Event-ID`), and those designs are unchanged.
+
+The pattern worth noting: Qodo's **defect** findings on this repo were
+consistently about *the boundary between claiming and doing* — success
+reported from an attempt, an approval reused across gates, a truthy string
+read as consent. That is the same class of error the whole project is built
+to prevent, which is a useful thing for a reviewer to keep catching.
+
+---
+
+## Limitations
+
+Stated plainly, because a demo that hides them is not a security tool.
+
+- **Containment records an authorised order; it does not enforce it.** See
+  *What containment actually does*. Provider adapters are the honest
+  remaining work.
+- **Sandbox execution is not used.** No sandbox provider is configured on
+  this TrueForge deployment, so enabling it would fail the turn.
+- **Delegation is slower and more exposed to provider rate limits.** It is
+  off by default for that reason.
+- **The console's token is a shared secret, not per-operator identity.** It
+  authenticates the console, not the person; there is no audit trail of
+  *which* human approved. Put it behind a real proxy for that.
+- **The evidence store is a seeded SQLite file**, not a SIEM. The MCP tool
+  boundary is the seam where a real one would attach.
+- **Run state is in memory.** Restarting the console loses in-flight runs;
+  the containment audit log survives, since it is on disk.
+- **`ui/server.py` prints the console URL with the token in it** when one is
+  set, so the operator can open it. That is a terminal, not a log — but it
+  is a deliberate trade, not an oversight.
+
+## Future work
+
+Provider adapters behind the approved containment interface (the finding from
+#5 taken all the way); per-operator identity on approvals so the audit log
+records *who*; collapsing the stdio runner onto `investigator/assessment.py`
+(the honest remainder of #3); sandboxed analysis of the authentication
+timeline once a sandbox provider is available.
+
+---
+
+## Repository map
+
+```
+data/init_db.py            the incident, and the only source of truth for it
+mcp/sentinel_mcp/          MCP server: 5 read-only tools, 2 gated destructive
+  server.py                  stdio + the tool definitions and annotations
+  http_server.py             authenticated streamable HTTP (TrueForge needs remote)
+investigator/              deterministic, no LLM, no HTTP
+  analyzer.py                evidence correlation
+  risk.py                    the authoritative score
+  assessment.py              the single composition path
+  containment.py             the only write path
+  prompts.py                 the agent's behaviour contract (tested as one)
+trueforge/                 the only package that speaks HTTP to TrueForge
+  client.py                  transport
+  agent.py                   agent spec, execution, trace extraction
+ui/                        the operator console
+  runner.py                  investigation → event stream; the gate lives here
+  server.py                  four routes
+  web/                       React; correlate.ts is a pure, tested reducer
+sentinel/                  demo orchestration; contains no security logic
+  preflight.py               readiness checks that name their own fix
+  demo.py                    reset → check → investigate → gate → report
+```
+
+### Why the MCP server also speaks HTTP
+
+TrueForge v0.1.4 accepts **remote MCP servers only** — its `MCPServerType`
+enum has the single value `"remote"` and the manifest requires a `url`. The
+stdio entrypoint cannot be registered with it, so `http_server.py` serves the
+*same* `server` object over streamable HTTP. The tools and the read-only
+model are identical. The HTTP transport is authenticated (stdio needs no
+credentials — the client spawns the process; a listening socket serving login
+histories does), and refuses a non-loopback bind without
+`SENTINEL_MCP_ALLOW_REMOTE=1`.
+
+Configuration is environment-driven; see `.env.example`. Everything has a
+working local default, and **Sentinel never reads a model provider API key** —
+those live in TrueForge's own settings.
