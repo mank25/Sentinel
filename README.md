@@ -428,7 +428,7 @@ it behind a real proxy if you need accountable, per-person access.
 
 ```bash
 pytest -q                 # 280 unit tests, no services required
-pytest -m integration -q  # 9 more; needs TrueForge + the MCP server running
+pytest -m integration -q  # 10 more; needs TrueForge + the MCP server running
 cd ui/web && npm test     # 24 frontend tests, no browser, no test framework
 ```
 

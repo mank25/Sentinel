@@ -25,7 +25,7 @@ import time
 import httpx2
 import pytest
 
-from trueforge.agent import SentinelAgent
+from trueforge.agent import SentinelAgent, deny_all
 from trueforge.client import TrueForgeClient, TrueForgeError
 from trueforge.config import TrueForgeConfig
 
@@ -196,14 +196,43 @@ def test_unknown_model_is_rejected_with_alternatives(stack, config):
 # End-to-end
 # ------------------------------------------------------------------
 
-def _investigate_with_retry(config, username):
-    """Run the investigation, retrying only transient provider outages."""
+DENIAL_REASON = "Integration test: denied so nothing is executed."
+
+
+def _deny_everything(pending):
+    """Refuse every containment request, and record that one was made.
+
+    Denial rather than approval is the right default for a test that runs
+    against the real stack: it exercises the whole gate -- pause, decision,
+    resume -- while executing nothing and leaving no state behind, so the
+    suite is repeatable and never writes to the containment audit log.
+    """
+
+    _deny_everything.seen.extend(pending)
+
+    return deny_all(pending, DENIAL_REASON)
+
+
+_deny_everything.seen = []
+
+
+def _investigate_with_retry(config, username, on_approval=_deny_everything):
+    """Run the investigation, retrying only transient provider outages.
+
+    A decision callback is supplied by default. Without one, an
+    investigation of a CRITICAL account pauses at the containment gate and
+    reports that it is waiting -- which is correct behaviour and used to
+    read here as a failed turn. The end-to-end tests want the whole journey
+    including the decision, so they answer the gate.
+    """
 
     last_error = None
 
     for attempt in range(MAX_TURN_ATTEMPTS):
+        _deny_everything.seen = []
+
         with SentinelAgent(config) as agent:
-            result = agent.investigate(username)
+            result = agent.investigate(username, on_approval=on_approval)
 
         if not result.get("error"):
             return result
@@ -247,6 +276,51 @@ def test_end_to_end_investigation_of_seeded_admin(stack, config):
     response = result["response"]
     assert "CRITICAL" in response
     assert "100" in response
+
+    # Nothing is left paused: the gate was answered and the turn finished.
+    assert result["pending_approvals"] == []
+
+
+def test_the_containment_gate_really_fires_against_a_live_harness(
+    stack, config
+):
+    """The safety property, asserted end to end rather than in a fake.
+
+    A CRITICAL account is exactly the case where the agent should propose
+    containment -- and TrueForge should stop it. This asserts the pause
+    happened, that it was for a destructive tool, and that denying it
+    executed nothing.
+    """
+
+    from investigator import containment
+
+    before = containment.list_actions()
+
+    result = _investigate_with_retry(config, "admin")
+
+    requested = _deny_everything.seen
+
+    assert requested, (
+        "The agent never proposed containment against a CRITICAL account, "
+        "so the approval gate was not exercised."
+    )
+
+    for item in requested:
+        assert item["tool"] in {"contain_account", "block_ip"}
+        # The operator has to be able to see what they are deciding on.
+        assert item["arguments"].get("justification"), (
+            f"{item['tool']} was proposed with no justification"
+        )
+        assert item["thread_id"]
+        assert item["tool_call_id"]
+
+    # Every decision was recorded as a denial, and reached the agent.
+    assert result["approvals"], "no decision was recorded"
+    assert all(not a["allowed"] for a in result["approvals"])
+    assert all(a["reason"] == DENIAL_REASON for a in result["approvals"])
+
+    # The point of a denial: the environment is unchanged.
+    assert containment.list_actions() == before
 
 
 def test_end_to_end_matches_the_deterministic_engine(stack, config):
