@@ -53,8 +53,33 @@ function ToolCard({ activity }: { activity: ToolActivity }) {
   );
 }
 
-function truncate(text: string): string {
+/**
+ * Render a tool result as text, whatever shape it arrived in.
+ *
+ * The runner forwards `content` from the TrueForge event unchanged, which
+ * keeps the trace faithful but means this is not guaranteed to be a string:
+ * MCP results can arrive as a list of content blocks. Passing an
+ * object-containing array to React as a child throws and takes the whole
+ * investigation view down with it, so coerce here rather than trusting the
+ * type. Fidelity is preserved -- a non-string is serialised, not discarded.
+ */
+function truncate(content: unknown): string {
+  if (content === null || content === undefined) return "";
+
+  const text =
+    typeof content === "string" ? content : safeStringify(content);
+
   return text.length > 1200 ? `${text.slice(0, 1200)}…` : text;
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    // Circular or otherwise unserialisable: show something rather than
+    // crashing the timeline.
+    return String(value);
+  }
 }
 
 export function Timeline({

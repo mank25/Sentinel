@@ -155,11 +155,26 @@ const PURPOSE: Record<string, string> = {
   block_ip: "Proposing an IP block",
 };
 
-/** Explains, in an operator's words, what a containment tool will do. */
+/**
+ * What a containment tool will do, in an operator's words -- scoped
+ * honestly.
+ *
+ * Approving records an authorised containment order in Sentinel's
+ * containment store, which is the system of record; a production deployment
+ * puts the identity-provider and perimeter adapters behind that same
+ * approved interface. Saying "the account is disabled" here would claim
+ * more than the action delivers, on the one screen where overstating is
+ * least acceptable.
+ */
 export const CONSEQUENCE: Record<string, string> = {
   contain_account:
-    "Disables the account. The user is signed out and cannot log back in.",
-  block_ip: "Blocks the address at the perimeter for all users.",
+    "Orders the account locked and its sessions revoked. Recorded as an " +
+    "active containment order; enforcement is applied by the identity " +
+    "provider adapter behind this interface.",
+  block_ip:
+    "Orders the address blocked at the perimeter for all users. Recorded " +
+    "as an active block; enforcement is applied by the perimeter adapter " +
+    "behind this interface.",
 };
 
 export function formatArguments(args: Record<string, unknown> = {}): string {
@@ -207,6 +222,28 @@ export function formatCall(
 }
 
 /**
+ * Unwrap an MCP result into the text it carries.
+ *
+ * A tool result is usually a JSON string, but MCP also allows a list of
+ * content blocks. `parse_assessment` on the Python side already handles
+ * both, so the console must too -- otherwise the same payload that yields a
+ * verdict there yields no facts here.
+ */
+function unwrapContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+
+  const text = content
+    .map((block) =>
+      block && typeof block === "object" && "text" in block
+        ? String((block as { text: unknown }).text)
+        : "",
+    )
+    .join("");
+
+  return text || content;
+}
+
+/**
  * Read the notable fields out of a tool result.
  *
  * Only fields the payload actually contains are reported -- nothing is
@@ -215,16 +252,18 @@ export function formatCall(
  */
 export function describeResult(
   tool: string,
-  content: string | null | undefined,
+  content: unknown,
 ): { label: string; value: string }[] {
   if (!content) return [];
 
-  let parsed: unknown;
+  let parsed: unknown = unwrapContent(content);
 
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    return [];
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return [];
+    }
   }
 
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {

@@ -548,3 +548,37 @@ test("a missing justification yields an empty reason, not a filled-in one", () =
   assert.equal(target, "username=admin");
   assert.equal(why, "");
 });
+
+// ------------------------------------------------------------------
+// Qodo #7-1: a non-string tool result must not reach React as a child
+// ------------------------------------------------------------------
+
+test("MCP content blocks are unwrapped into facts, not dropped", () => {
+  const blocks = [
+    { type: "text", text: JSON.stringify({ found: true, blocked: true }) },
+  ];
+
+  const facts = describeResult("get_ip_status", blocks as unknown);
+
+  assert.deepEqual(facts, [{ label: "blocked", value: "true" }]);
+});
+
+test("a tool result that is neither a string nor blocks yields no facts", () => {
+  assert.deepEqual(describeResult("get_ip_status", 42 as unknown), []);
+  assert.deepEqual(describeResult("get_ip_status", null), []);
+});
+
+test("content blocks still correlate to their call", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "tool_call", thread_id: "main", tool_call_id: "c1",
+      tool: "get_ip_status", arguments: {} },
+    { seq: 2, kind: "tool_result", thread_id: "main", tool_call_id: "c1",
+      tool: "get_ip_status",
+      content: [{ type: "text", text: '{"found":true,"blocked":true}' }] },
+  ] as unknown as RunEvent[]);
+
+  const call = state.items.find((item) => item.tool)?.tool;
+
+  assert.equal(call?.status, "done");
+  assert.deepEqual(call?.facts, [{ label: "blocked", value: "true" }]);
+});
