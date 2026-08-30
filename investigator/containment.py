@@ -49,6 +49,20 @@ CREATE TABLE IF NOT EXISTS containment_actions (
 """
 
 
+def _store(db_path: Path | None) -> Path:
+    """The containment store to use for one call.
+
+    ``None`` means "the configured store", read at call time rather than
+    bound into a default argument at import time. A default argument would
+    freeze :data:`DB_PATH` as it was when this module was first imported,
+    which makes the store impossible to redirect -- and the read-back half
+    of a containment action is exactly the thing that must be testable
+    against a scratch store.
+    """
+
+    return Path(db_path) if db_path is not None else DB_PATH
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -76,7 +90,7 @@ def record_action(
     justification: str,
     threat_level: str | None = None,
     risk_score: int | None = None,
-    db_path: Path = DB_PATH,
+    db_path: Path | None = None,
 ) -> dict:
     """Append one containment action to the audit log.
 
@@ -107,7 +121,7 @@ def record_action(
 
     timestamp = _now()
 
-    with closing(_connect(db_path)) as connection:
+    with closing(_connect(_store(db_path))) as connection:
         with connection:
             cursor = connection.execute(
                 """
@@ -141,8 +155,8 @@ def record_action(
     }
 
 
-def _actions_for(action: str, target: str, db_path: Path) -> list:
-    db_path = Path(db_path)
+def _actions_for(action: str, target: str, db_path: Path | None) -> list:
+    db_path = _store(db_path)
 
     if not db_path.is_file():
         return []
@@ -167,7 +181,7 @@ def _actions_for(action: str, target: str, db_path: Path) -> list:
     return [dict(row) for row in rows]
 
 
-def account_status(username: str, db_path: Path = DB_PATH) -> dict:
+def account_status(username: str, db_path: Path | None = None) -> dict:
     """Whether an account is currently contained, and why."""
 
     actions = _actions_for(ACTION_CONTAIN_ACCOUNT, username, db_path)
@@ -180,7 +194,7 @@ def account_status(username: str, db_path: Path = DB_PATH) -> dict:
     }
 
 
-def ip_status(ip_address: str, db_path: Path = DB_PATH) -> dict:
+def ip_status(ip_address: str, db_path: Path | None = None) -> dict:
     """Whether an IP is currently blocked, and why."""
 
     actions = _actions_for(ACTION_BLOCK_IP, ip_address, db_path)
@@ -193,10 +207,10 @@ def ip_status(ip_address: str, db_path: Path = DB_PATH) -> dict:
     }
 
 
-def list_actions(db_path: Path = DB_PATH) -> list:
+def list_actions(db_path: Path | None = None) -> list:
     """The whole containment audit log, newest first."""
 
-    db_path = Path(db_path)
+    db_path = _store(db_path)
 
     if not db_path.is_file():
         return []

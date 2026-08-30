@@ -156,22 +156,19 @@ async def get_network_activity(ip_address: str) -> dict:
 def _get_network_activity_sync(ip_address: str) -> dict:
     """Perform the read-only SQLite lookup in a worker thread."""
 
-    if not DB_PATH.exists():
+    if not DB_PATH.is_file():
         return {
             "found": False,
-            "error": "Security database is unavailable.",
+            "ip_address": ip_address,
+            **DB_UNAVAILABLE_ERROR,
         }
 
     connection = None
 
     try:
-        connection = sqlite3.connect(
-            f"file:{DB_PATH}?mode=ro",
-            uri=True,
-        )
-        connection.row_factory = sqlite3.Row
-
-        connection.execute("PRAGMA query_only = 1")
+        # Same helper the login lookup uses: `as_uri()` escapes a path that
+        # contains a space or a '?', which hand-built "file:{path}" did not.
+        connection = _connect_read_only(DB_PATH)
 
         row = connection.execute(
             """
@@ -255,15 +252,27 @@ async def assess_user_risk(username: str) -> dict:
 
 @server.tool(annotations=CONTAINMENT)
 async def contain_account(username: str, justification: str) -> dict:
-    """Lock an account and revoke its active sessions.
+    """Order containment of an account: lock it and revoke its sessions.
 
-    This is a containment action, not an investigation step. It is disruptive:
-    locking a privileged account can lock a legitimate operator out during an
-    incident, so it requires human approval before it runs.
+    Scope, stated plainly because an agent must not overstate what it did:
+    this records an authorised containment order in Sentinel's containment
+    store, which is the system of record for response actions. It does not
+    itself call an identity provider -- a production deployment puts a
+    provider adapter behind this same approved interface, which is where the
+    lock and session revocation are applied. What is real here is the
+    authorisation, the audit record and the read-back: get_account_status
+    reports the order as in force, and a later investigation sees it.
 
-    Record the reason in ``justification`` -- it is written to the containment
-    audit log alongside the action and must state the evidence that warranted
-    it.
+    Treat the return value as "the order was accepted", not "the account is
+    locked". Confirm with get_account_status before reporting success.
+
+    This is a containment action, not an investigation step. It is
+    disruptive: containing a privileged account can lock a legitimate
+    operator out during an incident, so it requires human approval before it
+    runs.
+
+    Record the reason in ``justification`` -- it is written to the audit log
+    alongside the action and must state the evidence that warranted it.
     """
 
     return await asyncio.to_thread(
@@ -276,14 +285,23 @@ async def contain_account(username: str, justification: str) -> dict:
 
 @server.tool(annotations=CONTAINMENT)
 async def block_ip(ip_address: str, justification: str) -> dict:
-    """Block an IP address at the network perimeter.
+    """Order an IP address blocked at the network perimeter.
 
-    This is a containment action, not an investigation step. It is disruptive:
-    a single address may be a shared VPN or NAT egress serving unrelated
-    users, so it requires human approval before it runs.
+    Same scope as contain_account: this records an authorised block in
+    Sentinel's containment store. It does not itself program a firewall -- a
+    production deployment puts a perimeter adapter behind this approved
+    interface. The authorisation, the audit record and the read-back
+    (get_ip_status) are real.
 
-    Record the reason in ``justification`` -- it is written to the containment
-    audit log alongside the action.
+    Treat the return value as "the order was accepted", not "the address is
+    blocked". Confirm with get_ip_status before reporting success.
+
+    This is a containment action, not an investigation step. It is
+    disruptive: a single address may be a shared VPN or NAT egress serving
+    unrelated users, so it requires human approval before it runs.
+
+    Record the reason in ``justification`` -- it is written to the audit log
+    alongside the action.
     """
 
     return await asyncio.to_thread(
@@ -299,10 +317,28 @@ async def get_account_status(username: str) -> dict:
     """Report whether an account is currently contained, and why.
 
     Reads the containment audit log so an investigation can see response
-    actions that were already taken. This is a read-only tool.
+    actions that were already taken. Use it twice: before proposing
+    containment, to avoid asking for something already in force, and again
+    after an approved ``contain_account`` call, to confirm the action
+    actually took effect. This is a read-only tool.
     """
 
     return await asyncio.to_thread(containment.account_status, username)
+
+
+@server.tool(annotations=READ_ONLY)
+async def get_ip_status(ip_address: str) -> dict:
+    """Report whether an IP is currently blocked, and why.
+
+    The read-back half of a containment action. ``block_ip`` returns what it
+    attempted; this reports what the containment store actually holds, which
+    is the only thing that can confirm a block is in force. Call it after an
+    approved ``block_ip`` rather than trusting that call's own return value.
+
+    This is a read-only tool.
+    """
+
+    return await asyncio.to_thread(containment.ip_status, ip_address)
 
 
 async def main():

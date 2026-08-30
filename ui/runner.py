@@ -201,6 +201,11 @@ class InvestigationRun:
         Called from the agent thread while the turn is still running. Every
         entry here came from an event TrueForge actually recorded -- this
         maps them onto the console's event vocabulary and adds nothing.
+
+        ``thread_id`` rides along on the tool events because the console
+        correlates a result to its call exactly the way
+        :func:`trueforge.agent.extract_trace` does -- on
+        ``(thread_id, tool_call_id)``, never on the id alone.
         """
 
         for entry in entries:
@@ -217,6 +222,7 @@ class InvestigationRun:
             elif step == "tool.call":
                 self.emit(
                     "tool_call",
+                    thread_id=entry.get("thread_id"),
                     tool_call_id=entry.get("tool_call_id"),
                     tool=entry.get("tool"),
                     arguments=entry.get("arguments", {}),
@@ -226,6 +232,7 @@ class InvestigationRun:
             elif step == "tool.response":
                 self.emit(
                     "tool_result",
+                    thread_id=entry.get("thread_id"),
                     tool_call_id=entry.get("tool_call_id"),
                     tool=entry.get("tool"),
                     content=entry.get("content"),
@@ -238,7 +245,29 @@ class InvestigationRun:
             elif step == "model.message":
                 self.emit(
                     "agent_message",
+                    thread_id=entry.get("thread_id"),
                     content=entry.get("content"),
+                    created_at=entry.get("created_at"),
+                )
+
+            # Delegated investigations only. TrueForge records a thread per
+            # subagent; publishing the lifecycle is what lets the console
+            # show which specialist made which call instead of one
+            # undifferentiated stream. Absent in a linear run, so the
+            # console renders exactly as before.
+            elif step == "thread.created":
+                self.emit(
+                    "thread_started",
+                    thread_id=entry.get("thread_id"),
+                    name=entry.get("name"),
+                    parent_thread_id=entry.get("parent_thread_id"),
+                    created_at=entry.get("created_at"),
+                )
+
+            elif step == "thread.done":
+                self.emit(
+                    "thread_finished",
+                    thread_id=entry.get("thread_id"),
                     created_at=entry.get("created_at"),
                 )
 

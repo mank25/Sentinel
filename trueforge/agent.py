@@ -19,6 +19,7 @@ import json
 import time
 
 from investigator.prompts import (
+    DELEGATED_LEAD_PROMPT,
     SENTINEL_SYSTEM_PROMPT,
     investigation_request,
 )
@@ -85,20 +86,40 @@ class SentinelAgentError(TrueForgeError):
 def build_agent_spec(config: TrueForgeConfig) -> dict:
     """The TrueForge ``AgentSpec`` for the Sentinel investigator.
 
-    Every Sentinel tool is read-only and annotated as such, so none of them
-    require human approval. Sub-agents and generative UI are off so that the
-    execution trace stays a single linear investigation -- the tool calls are
-    the demonstrable part of the run, and a sub-agent would hide them in a
-    separate thread.
+    Two shapes, selected by ``config.delegate``:
 
-    ``iteration_limit`` doubles as a cost ceiling: a normal investigation
-    uses four or five model calls, and this caps a runaway loop well before
-    it becomes expensive.
+    * **Linear** (default) -- one thread. Subagents are off, so the trace is
+      a single readable investigation and every tool call is visible in it.
+    * **Delegated** -- a lead analyst that commissions specialist subagents
+      and correlates their findings. TrueForge gives each subagent its own
+      thread, which is precisely why tool results are correlated on
+      ``(thread_id, tool_call_id)`` rather than on the id alone.
+
+    What does **not** change between them is what anything is allowed to do.
+    ``require_approval_for_tools`` is attached to the MCP server, so it binds
+    the *tools* rather than the thread that calls them: a subagent invoking
+    ``block_ip`` is paused for a human exactly as the lead would be. The
+    delegation brief also tells specialists not to propose containment, but
+    that is about keeping the investigation coherent -- the gate is what
+    makes it safe, and the gate is in the harness.
+
+    Generative UI and user questions stay off in both shapes: they would put
+    turn-blocking interactions in front of the operator that are not the
+    containment decision, which is the one interaction this console exists
+    to present.
+
+    ``iteration_limit`` doubles as a cost ceiling. A linear investigation
+    uses four or five model calls; delegation needs materially more, because
+    each specialist runs its own loop, so the ceiling is raised only in that
+    shape and still caps a runaway loop well before it becomes expensive.
     """
 
     return {
         "model": {"name": config.model},
-        "instructions": SENTINEL_SYSTEM_PROMPT,
+        "instructions": (
+            DELEGATED_LEAD_PROMPT if config.delegate
+            else SENTINEL_SYSTEM_PROMPT
+        ),
         "mcp_servers": [
             {
                 "name": config.mcp_server_name,
@@ -116,9 +137,14 @@ def build_agent_spec(config: TrueForgeConfig) -> dict:
             }
         ],
         "config": {
-            "iteration_limit": 12,
+            "iteration_limit": 30 if config.delegate else 12,
+            # Sandbox execution is unavailable on this deployment: TrueForge
+            # v0.1.4 sandboxes are Daytona-backed and no sandbox provider is
+            # configured (GET /api/v1/settings/sandbox-providers returns
+            # "No sandbox provider configured"). Enabling it here would fail
+            # the turn rather than add a capability.
             "sandbox": {"enabled": False},
-            "dynamic_sub_agents": {"enabled": False},
+            "dynamic_sub_agents": {"enabled": bool(config.delegate)},
             "generative_ui": {"enabled": False},
             "ask_user_questions": {"enabled": False},
         },
@@ -145,12 +171,45 @@ def _parse_arguments(raw):
         return {"_raw": raw}
 
 
+# The root agent's thread. TrueForge stamps `thread_id` on every
+# thread-scoped event and names the root thread "main"; each subagent gets a
+# minted id. Events recorded before subagents existed carry no field at all,
+# so reading a missing one as the main thread keeps old traces correct.
+DEFAULT_THREAD_ID = "main"
+
+
+def _thread_of(event: dict) -> str:
+    """The thread an event belongs to.
+
+    Falls back to :data:`DEFAULT_THREAD_ID` only when the event carries no
+    usable id -- an older event without the field, or a run-level event whose
+    ``thread_id`` is explicitly null. No id is ever invented for an event that
+    has one.
+    """
+
+    thread_id = event.get("thread_id")
+
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+
+    return DEFAULT_THREAD_ID
+
+
 def extract_trace(events: list) -> list:
     """Turn raw TrueForge turn events into an ordered investigation journey.
 
     Nothing here is synthesised: every entry comes from an event TrueForge
-    actually recorded. Tool calls are read from ``model.message.tool_calls``
-    and paired with their ``tool.response`` by ``tool_call_id``.
+    actually recorded.
+
+    Tool calls are read from ``model.message.tool_calls`` and paired with
+    their ``tool.response`` by **(thread_id, tool_call_id)**, never by
+    ``tool_call_id`` alone. Once more than one thread can run in a turn, the
+    id is no longer unique: it is minted per conversation by the model
+    provider (observed values are short counters like ``call_2394998``), so
+    two threads can independently produce the same one. Pairing on the id
+    alone would attach a subagent's result to the parent's tool call. The
+    thread is what makes the identity unique; the id is kept exactly as
+    TrueForge recorded it.
     """
 
     trace = []
@@ -162,6 +221,7 @@ def extract_trace(events: list) -> list:
             event = event["event"]
 
         kind = event.get("type")
+        thread_id = _thread_of(event)
 
         if kind == "mcp.initialize":
             for info in event.get("mcp_servers", []):
@@ -169,6 +229,7 @@ def extract_trace(events: list) -> list:
                     "step": "mcp.initialize",
                     "server": info.get("name"),
                     "transport": info.get("transport_type"),
+                    "thread_id": thread_id,
                     "created_at": event.get("created_at"),
                 })
 
@@ -181,6 +242,7 @@ def extract_trace(events: list) -> list:
                     "step": "tool.call",
                     "tool": function.get("name"),
                     "arguments": _parse_arguments(function.get("arguments")),
+                    "thread_id": thread_id,
                     "tool_call_id": call_id,
                     "created_at": event.get("created_at"),
                 }
@@ -188,7 +250,7 @@ def extract_trace(events: list) -> list:
                 trace.append(entry)
 
                 if call_id:
-                    pending[call_id] = entry
+                    pending[(thread_id, call_id)] = entry
 
             content = event.get("content")
 
@@ -196,16 +258,18 @@ def extract_trace(events: list) -> list:
                 trace.append({
                     "step": "model.message",
                     "content": content,
+                    "thread_id": thread_id,
                     "created_at": event.get("created_at"),
                 })
 
         elif kind == "tool.response":
             call_id = event.get("tool_call_id")
-            call = pending.get(call_id, {})
+            call = pending.get((thread_id, call_id), {})
 
             trace.append({
                 "step": "tool.response",
                 "tool": call.get("tool"),
+                "thread_id": thread_id,
                 "tool_call_id": call_id,
                 "content": event.get("content"),
                 "created_at": event.get("created_at"),
@@ -215,9 +279,34 @@ def extract_trace(events: list) -> list:
             for call in event.get("tool_calls") or []:
                 trace.append({
                     "step": "tool.approval_required",
+                    "thread_id": thread_id,
                     "tool_call_id": call.get("id"),
                     "created_at": event.get("created_at"),
                 })
+
+        elif kind == "thread.created":
+            parent = event.get("parent") or {}
+            agent_info = event.get("agent_info") or {}
+
+            trace.append({
+                "step": "thread.created",
+                "thread_id": event.get("thread_id"),
+                "name": agent_info.get("name"),
+                "parent_thread_id": parent.get("thread_id"),
+                "parent_tool_call_id": parent.get("tool_call_id"),
+                "created_at": event.get("created_at"),
+            })
+
+        elif kind == "thread.done":
+            parent = event.get("parent") or {}
+
+            trace.append({
+                "step": "thread.done",
+                "thread_id": event.get("thread_id"),
+                "parent_thread_id": parent.get("thread_id"),
+                "parent_tool_call_id": parent.get("tool_call_id"),
+                "created_at": event.get("created_at"),
+            })
 
         elif kind == "turn.done":
             state = event.get("state", {})
@@ -227,6 +316,9 @@ def extract_trace(events: list) -> list:
                 "status": state.get("status"),
                 "created_at": event.get("created_at"),
             })
+
+        # Any other event type is ignored. New TrueForge event types must
+        # never break an investigation trace.
 
     return trace
 
@@ -274,8 +366,16 @@ def pending_approvals(turn: dict, trace: list) -> list:
     """
 
     state = turn.get("state", {})
+
+    # Keyed by (thread_id, tool_call_id) for the same reason extract_trace
+    # pairs on it: with more than one thread the id alone is ambiguous, and
+    # resolving it wrongly would show the operator the arguments of a
+    # different call than the one they are being asked to approve.
     calls_by_id = {
-        entry.get("tool_call_id"): entry
+        (
+            entry.get("thread_id", DEFAULT_THREAD_ID),
+            entry.get("tool_call_id"),
+        ): entry
         for entry in trace
         if entry.get("step") == "tool.call"
     }
@@ -286,11 +386,11 @@ def pending_approvals(turn: dict, trace: list) -> list:
         if action.get("type") != "tool.approval_required":
             continue
 
-        thread_id = action.get("thread_id", "main")
+        thread_id = action.get("thread_id", DEFAULT_THREAD_ID)
 
         for call in action.get("tool_calls") or []:
             call_id = call.get("id")
-            requested = calls_by_id.get(call_id, {})
+            requested = calls_by_id.get((thread_id, call_id), {})
 
             pending.append({
                 "thread_id": thread_id,
@@ -412,14 +512,14 @@ class SentinelAgent:
 
         try:
             return self.client.upsert_agent(
-                self.config.agent_name,
+                self.config.effective_agent_name,
                 build_agent_spec(self.config),
             )
 
         except TrueForgeError as exc:
             raise SentinelAgentError(
                 f"Could not create the Sentinel agent "
-                f"'{self.config.agent_name}': {exc}"
+                f"'{self.config.effective_agent_name}': {exc}"
             ) from exc
 
     def ensure_model(self) -> str:
@@ -553,7 +653,9 @@ class SentinelAgent:
             self.provision()
 
         try:
-            session = self.client.create_session(self.config.agent_name)
+            session = self.client.create_session(
+                self.config.effective_agent_name
+            )
 
         except TrueForgeError as exc:
             raise SentinelAgentError(

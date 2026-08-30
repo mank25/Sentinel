@@ -22,9 +22,18 @@ import type {
   Status,
 } from "./types";
 
+/**
+ * The root agent's thread, used when an event carries no id.
+ *
+ * Mirrors `DEFAULT_THREAD_ID` in trueforge/agent.py.
+ */
+export const MAIN_THREAD = "main";
+
 export type ToolStatus = "running" | "done";
 
 export interface ToolActivity {
+  /** The TrueForge thread that made the call ("main" for the root agent). */
+  threadId: string;
   toolCallId: string;
   tool: string;
   arguments: Record<string, unknown>;
@@ -36,6 +45,23 @@ export interface ToolActivity {
   startedAt?: string;
   finishedAt?: string;
   durationMs?: number;
+}
+
+/**
+ * One TrueForge thread. The root agent is always present; a delegated
+ * investigation adds one per specialist subagent.
+ *
+ * This exists so the timeline can say *who* made a call. It is also why
+ * tool results correlate on `(threadId, toolCallId)`: `tool_call_id` is
+ * minted per conversation, so two threads can independently produce the
+ * same one.
+ */
+export interface ThreadInfo {
+  threadId: string;
+  /** The subagent's display name, or null for the root agent. */
+  name: string | null;
+  parentThreadId: string | null;
+  running: boolean;
 }
 
 export interface ApprovalRecord {
@@ -61,6 +87,8 @@ export interface TimelineItem {
   detail?: string;
   tool?: ToolActivity;
   approval?: ApprovalRecord;
+  /** The thread this entry belongs to, for lane labelling. */
+  threadId?: string;
 }
 
 export interface ConsoleState {
@@ -75,6 +103,8 @@ export interface ConsoleState {
   approvals: Approval[];
   error: string | null;
   lastSeq: number;
+  /** Threads seen so far, in the order TrueForge created them. */
+  threads: ThreadInfo[];
 }
 
 export function initialState(): ConsoleState {
@@ -90,7 +120,28 @@ export function initialState(): ConsoleState {
     approvals: [],
     error: null,
     lastSeq: 0,
+    threads: [],
   };
+}
+
+/**
+ * Name a thread for display.
+ *
+ * Falls back to a short form of the id when TrueForge gave the subagent no
+ * name -- never to a role invented here. The console labels threads; it does
+ * not decide what they were for.
+ */
+export function threadLabel(
+  threads: ThreadInfo[],
+  threadId: string | undefined,
+): string | null {
+  if (!threadId || threadId === MAIN_THREAD) return null;
+
+  const known = threads.find((thread) => thread.threadId === threadId);
+
+  if (known?.name) return known.name;
+
+  return `thread ${threadId.slice(0, 8)}`;
 }
 
 /** What each tool is doing, in an operator's words rather than an API's. */
@@ -98,16 +149,32 @@ const PURPOSE: Record<string, string> = {
   get_login_history: "Reading login evidence",
   get_network_activity: "Corroborating with network intelligence",
   assess_user_risk: "Deterministic risk engine",
-  get_account_status: "Checking existing containment",
+  get_account_status: "Verifying account containment state",
+  get_ip_status: "Verifying whether the address is blocked",
   contain_account: "Proposing account containment",
   block_ip: "Proposing an IP block",
 };
 
-/** Explains, in an operator's words, what a containment tool will do. */
+/**
+ * What a containment tool will do, in an operator's words -- scoped
+ * honestly.
+ *
+ * Approving records an authorised containment order in Sentinel's
+ * containment store, which is the system of record; a production deployment
+ * puts the identity-provider and perimeter adapters behind that same
+ * approved interface. Saying "the account is disabled" here would claim
+ * more than the action delivers, on the one screen where overstating is
+ * least acceptable.
+ */
 export const CONSEQUENCE: Record<string, string> = {
   contain_account:
-    "Disables the account. The user is signed out and cannot log back in.",
-  block_ip: "Blocks the address at the perimeter for all users.",
+    "Orders the account locked and its sessions revoked. Recorded as an " +
+    "active containment order; enforcement is applied by the identity " +
+    "provider adapter behind this interface.",
+  block_ip:
+    "Orders the address blocked at the perimeter for all users. Recorded " +
+    "as an active block; enforcement is applied by the perimeter adapter " +
+    "behind this interface.",
 };
 
 export function formatArguments(args: Record<string, unknown> = {}): string {
@@ -116,11 +183,64 @@ export function formatArguments(args: Record<string, unknown> = {}): string {
     .join(", ");
 }
 
+/**
+ * Split a containment call's arguments into the target and the reason.
+ *
+ * A containment tool takes exactly one target argument plus a
+ * `justification`. Separating them lets the approval card lead with *what*
+ * is being acted on and give the *why* the room a full paragraph needs.
+ *
+ * Nothing is invented: an argument set without a justification yields an
+ * empty `why`, which the card reports as a missing justification rather
+ * than filling in.
+ */
+export function splitJustification(args: Record<string, unknown> = {}): {
+  target: string;
+  why: string;
+} {
+  const { justification, ...rest } = args;
+
+  const target = Object.entries(rest)
+    .map(([key, value]) =>
+      typeof value === "string"
+        ? `${key}=${value}`
+        : `${key}=${JSON.stringify(value)}`,
+    )
+    .join(", ");
+
+  return {
+    target,
+    why: typeof justification === "string" ? justification : "",
+  };
+}
+
 export function formatCall(
   tool: string,
   args: Record<string, unknown> = {},
 ): string {
   return `${tool}(${formatArguments(args)})`;
+}
+
+/**
+ * Unwrap an MCP result into the text it carries.
+ *
+ * A tool result is usually a JSON string, but MCP also allows a list of
+ * content blocks. `parse_assessment` on the Python side already handles
+ * both, so the console must too -- otherwise the same payload that yields a
+ * verdict there yields no facts here.
+ */
+function unwrapContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+
+  const text = content
+    .map((block) =>
+      block && typeof block === "object" && "text" in block
+        ? String((block as { text: unknown }).text)
+        : "",
+    )
+    .join("");
+
+  return text || content;
 }
 
 /**
@@ -132,16 +252,18 @@ export function formatCall(
  */
 export function describeResult(
   tool: string,
-  content: string | null | undefined,
+  content: unknown,
 ): { label: string; value: string }[] {
   if (!content) return [];
 
-  let parsed: unknown;
+  let parsed: unknown = unwrapContent(content);
 
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    return [];
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return [];
+    }
   }
 
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -198,6 +320,16 @@ export function describeResult(
 
     case "get_account_status":
       add("contained", body.contained);
+      if (Array.isArray(body.containment_actions)) {
+        add("recorded actions", body.containment_actions.length);
+      }
+      break;
+
+    // The read-back half of a containment action. `blocked` is what
+    // actually confirms a block is in force -- block_ip's own return value
+    // only reports what it attempted.
+    case "get_ip_status":
+      add("blocked", body.blocked);
       if (Array.isArray(body.containment_actions)) {
         add("recorded actions", body.containment_actions.length);
       }
@@ -291,6 +423,7 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
 
     case "tool_call": {
       const toolCallId = event.tool_call_id ?? `seq-${event.seq}`;
+      const threadId = event.thread_id ?? MAIN_THREAD;
       const tool = event.tool ?? "(unnamed tool)";
 
       return {
@@ -301,7 +434,9 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
             kind: "tool",
             title: tool,
             sub: PURPOSE[tool],
+            threadId,
             tool: {
+              threadId,
               toolCallId,
               tool,
               arguments: event.arguments ?? {},
@@ -317,11 +452,17 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
 
     case "tool_result": {
       const id = event.tool_call_id;
+      const threadId = event.thread_id ?? MAIN_THREAD;
       let matched = false;
 
       const items = next.items.map((item) => {
         if (matched || !item.tool) return item;
+        // A result belongs to the call with the same id *on the same
+        // thread*. tool_call_id is minted per conversation, so two threads
+        // can produce the same one; matching on it alone would attach a
+        // subagent's result to the parent's call.
         if (id === null || item.tool.toolCallId !== id) return item;
+        if (item.tool.threadId !== threadId) return item;
         if (item.tool.status === "done") return item;
 
         matched = true;
@@ -349,6 +490,7 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
               kind: "tool",
               title: event.tool ?? "tool result",
               tool: {
+                threadId,
                 toolCallId: id ?? `seq-${event.seq}`,
                 tool: event.tool ?? "(unknown)",
                 arguments: {},
@@ -371,7 +513,65 @@ export function reduce(state: ConsoleState, event: RunEvent): ConsoleState {
         ...next,
         items: push(
           next,
-          { kind: "agent", title: "Agent", detail: event.content },
+          {
+            kind: "agent",
+            title: "Agent",
+            detail: event.content,
+            threadId: event.thread_id ?? MAIN_THREAD,
+          },
+          event.seq,
+        ),
+      };
+
+    // A delegated investigation only. Recording the thread lets the
+    // timeline attribute each call to the specialist that made it; a
+    // linear run never emits these and renders exactly as before.
+    case "thread_started": {
+      const already = next.threads.some(
+        (thread) => thread.threadId === event.thread_id,
+      );
+
+      return {
+        ...next,
+        threads: already
+          ? next.threads
+          : [
+              ...next.threads,
+              {
+                threadId: event.thread_id,
+                name: event.name,
+                parentThreadId: event.parent_thread_id,
+                running: true,
+              },
+            ],
+        items: push(
+          next,
+          {
+            kind: "note",
+            title: `Specialist started · ${event.name ?? "subagent"}`,
+            sub: "delegated investigation — its own TrueForge thread",
+            threadId: event.thread_id,
+          },
+          event.seq,
+        ),
+      };
+    }
+
+    case "thread_finished":
+      return {
+        ...next,
+        threads: next.threads.map((thread) =>
+          thread.threadId === event.thread_id
+            ? { ...thread, running: false }
+            : thread,
+        ),
+        items: push(
+          next,
+          {
+            kind: "note",
+            title: "Specialist finished",
+            threadId: event.thread_id,
+          },
           event.seq,
         ),
       };

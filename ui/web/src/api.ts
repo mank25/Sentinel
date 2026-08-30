@@ -96,12 +96,21 @@ export function followRun(
     source = new EventSource(url(`/api/investigations/${runId}/events`));
 
     source.onopen = () => {
-      attempt = 0;
+      // Deliberately does NOT reset `attempt`. A handshake only proves the
+      // socket opened; a server that accepts connections and drops them
+      // immediately would otherwise refill the retry budget on every cycle
+      // and reconnect forever instead of surfacing the failure. The budget
+      // is restored below, once a frame has actually been delivered --
+      // which is the first moment the connection has demonstrably worked.
       onLink("live");
     };
 
     source.onmessage = (message) => {
       if (!message.data) return;
+
+      // A delivered frame is the stability condition. Past this point the
+      // connection did its job, so a later drop starts from a full budget.
+      attempt = 0;
 
       let event: RunEvent;
 

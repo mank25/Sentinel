@@ -965,3 +965,154 @@ def test_replay_after_reconnect_yields_no_duplicates():
         range(1, len(run.history()) + 1)
     )
     assert len(combined) == len(run.history())
+
+
+def test_tool_events_carry_the_thread_that_made_the_call():
+    """The console correlates on (thread_id, tool_call_id), so the runner
+    must publish the thread alongside the id."""
+
+    run = InvestigationRun("admin", agent_factory=FakeAgent)
+
+    run._on_trace([
+        {
+            "step": "tool.call",
+            "tool": "get_login_history",
+            "arguments": {"username": "admin"},
+            "thread_id": "main",
+            "tool_call_id": "call_123",
+            "created_at": "2026-08-30T10:00:00Z",
+        },
+        {
+            "step": "tool.call",
+            "tool": "get_network_activity",
+            "arguments": {"ip_address": "185.123.45.67"},
+            "thread_id": "subagent-abc",
+            "tool_call_id": "call_123",
+            "created_at": "2026-08-30T10:00:01Z",
+        },
+        {
+            "step": "tool.response",
+            "tool": "get_network_activity",
+            "thread_id": "subagent-abc",
+            "tool_call_id": "call_123",
+            "content": '{"found": true}',
+            "created_at": "2026-08-30T10:00:02Z",
+        },
+    ])
+
+    calls = [e for e in run.history() if e["kind"] == "tool_call"]
+    results = [e for e in run.history() if e["kind"] == "tool_result"]
+
+    # The same tool_call_id on two threads stays distinguishable downstream.
+    assert [(c["thread_id"], c["tool_call_id"]) for c in calls] == [
+        ("main", "call_123"),
+        ("subagent-abc", "call_123"),
+    ]
+    assert results[0]["thread_id"] == "subagent-abc"
+    assert results[0]["tool_call_id"] == "call_123"
+
+
+# ------------------------------------------------------------------
+# Delegated investigations on the event stream
+#
+# A subagent's work must reach the console attributed to the thread that
+# did it. These use the runner's trace callback directly, which is the
+# seam TrueForge's events arrive through.
+# ------------------------------------------------------------------
+
+def test_thread_lifecycle_reaches_the_console():
+    run = InvestigationRun("admin", agent_factory=_never_called)
+
+    run._on_trace([
+        {"step": "thread.created", "thread_id": "t1",
+         "name": "Identity Analyst", "parent_thread_id": "main",
+         "created_at": "2026-08-26T02:24:18"},
+        {"step": "thread.done", "thread_id": "t1",
+         "created_at": "2026-08-26T02:24:20"},
+    ])
+
+    kinds = [event["kind"] for event in run.history()]
+
+    assert kinds == ["thread_started", "thread_finished"]
+
+    started = run.history()[0]
+
+    assert started["thread_id"] == "t1"
+    assert started["name"] == "Identity Analyst"
+    assert started["parent_thread_id"] == "main"
+
+
+def test_a_linear_run_publishes_no_thread_events():
+    """Nothing about the console changes when there are no subagents."""
+
+    run = InvestigationRun("admin", agent_factory=_never_called)
+
+    run._on_trace([
+        {"step": "tool.call", "thread_id": "main", "tool_call_id": "call_1",
+         "tool": "get_login_history", "arguments": {"username": "admin"}},
+    ])
+
+    kinds = [event["kind"] for event in run.history()]
+
+    assert "thread_started" not in kinds
+    assert kinds == ["tool_call"]
+
+
+def test_tool_events_carry_the_thread_that_made_them():
+    """Correlation in the browser depends on this field being present."""
+
+    run = InvestigationRun("admin", agent_factory=_never_called)
+
+    run._on_trace([
+        {"step": "tool.call", "thread_id": "t1", "tool_call_id": "call_7",
+         "tool": "get_network_activity", "arguments": {}},
+        {"step": "tool.response", "thread_id": "t1", "tool_call_id": "call_7",
+         "tool": "get_network_activity", "content": "{}"},
+    ])
+
+    for event in run.history():
+        assert event["thread_id"] == "t1"
+        assert event["tool_call_id"] == "call_7"
+
+
+def test_the_same_tool_call_id_on_two_threads_stays_distinguishable():
+    """The bug this branch exists to fix, at the console's own boundary.
+
+    Two threads can mint the same tool_call_id. If the console's event
+    stream dropped the thread, the browser could not tell the two results
+    apart -- and would attach a subagent's answer to the lead's question.
+    """
+
+    run = InvestigationRun("admin", agent_factory=_never_called)
+
+    run._on_trace([
+        {"step": "tool.call", "thread_id": "A", "tool_call_id": "call_123",
+         "tool": "get_login_history", "arguments": {}},
+        {"step": "tool.call", "thread_id": "B", "tool_call_id": "call_123",
+         "tool": "get_network_activity", "arguments": {}},
+        {"step": "tool.response", "thread_id": "B", "tool_call_id": "call_123",
+         "tool": "get_network_activity", "content": '{"found": true}'},
+    ])
+
+    events = run.history()
+
+    assert [event["thread_id"] for event in events] == ["A", "B", "B"]
+
+    response = events[-1]
+
+    assert response["kind"] == "tool_result"
+    assert response["thread_id"] == "B"
+
+
+def test_an_agent_message_carries_its_thread():
+    run = InvestigationRun("admin", agent_factory=_never_called)
+
+    run._on_trace([
+        {"step": "model.message", "thread_id": "t1", "content": "findings"},
+    ])
+
+    assert run.history()[0]["thread_id"] == "t1"
+
+
+def _never_called():
+    raise AssertionError("these tests drive the trace callback directly")

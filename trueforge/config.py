@@ -23,6 +23,13 @@ DEFAULT_MODEL = "google-gemini/gemini-3-6-flash"
 DEFAULT_MCP_SERVER_NAME = "sentinel-security"
 DEFAULT_MCP_URL = "http://127.0.0.1:8791/mcp"
 DEFAULT_AGENT_NAME = "sentinel-investigator"
+
+# The delegated investigator is a *separate* TrueForge agent, not a mutation
+# of the linear one. Two reasons: provisioning is create-or-replace, so
+# sharing a name would mean each run silently rewrites the other's spec; and
+# a judge comparing the two paths should be able to see both definitions
+# sitting side by side in TrueForge.
+DELEGATED_AGENT_NAME = "sentinel-investigator-delegated"
 DEFAULT_TIMEOUT = 300.0
 
 # The tools the agent is allowed to reach, named explicitly rather than with
@@ -32,6 +39,7 @@ EVIDENCE_TOOLS = [
     "get_network_activity",
     "assess_user_risk",
     "get_account_status",
+    "get_ip_status",
 ]
 
 # Containment tools change state. They are annotated destructive on the MCP
@@ -75,6 +83,12 @@ class TrueForgeConfig:
     agent_name: str = DEFAULT_AGENT_NAME
     timeout: float = DEFAULT_TIMEOUT
     tools: list = field(default_factory=lambda: list(SENTINEL_TOOLS))
+    # Run the investigation as a lead agent with specialist subagents rather
+    # than as a single linear thread. Off by default: delegation multiplies
+    # the model calls a run needs, which makes it slower and more exposed to
+    # provider rate limiting. It changes who gathers the evidence, never
+    # what is allowed -- see build_agent_spec.
+    delegate: bool = False
     # Bearer token the Sentinel MCP HTTP server requires. Resolved lazily so
     # constructing a config never creates a token as a side effect.
     mcp_token: str | None = None
@@ -104,6 +118,15 @@ class TrueForgeConfig:
             timeout=_env_float("TRUEFORGE_TIMEOUT", DEFAULT_TIMEOUT),
             mcp_token=resolve_token(),
         )
+
+    @property
+    def effective_agent_name(self) -> str:
+        """The TrueForge agent this run provisions and opens a session on."""
+
+        if self.delegate and self.agent_name == DEFAULT_AGENT_NAME:
+            return DELEGATED_AGENT_NAME
+
+        return self.agent_name
 
     @property
     def api(self) -> str:

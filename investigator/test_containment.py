@@ -277,3 +277,97 @@ def test_ip_status_lookup_matches_a_padded_target(tmp_path):
 
     assert containment.ip_status(" 185.123.45.67 ", db_path=db)["blocked"]
     assert containment.ip_status("185.123.45.67", db_path=db)["blocked"]
+
+
+# ------------------------------------------------------------------
+# Verification -- reading the outcome back
+#
+# A containment call returning without raising is an *attempt*. These
+# tests hold the line that the read-back, not the call, is what makes an
+# action confirmable -- and that a failed attempt can never read back as a
+# success.
+# ------------------------------------------------------------------
+
+def test_a_rejected_action_leaves_nothing_to_verify(store):
+    """A refused write must not read back as containment in force."""
+
+    result = record_action(
+        ACTION_BLOCK_IP,
+        "185.123.45.67",
+        "",                      # no justification -- rejected
+        db_path=store,
+    )
+
+    assert result["ok"] is False
+    assert ip_status("185.123.45.67", db_path=store)["blocked"] is False
+    assert list_actions(db_path=store) == []
+
+
+def test_an_unknown_action_is_rejected_and_records_nothing(store):
+    result = record_action("delete_everything", "admin", "why", db_path=store)
+
+    assert result["ok"] is False
+    assert account_status("admin", db_path=store)["contained"] is False
+    assert list_actions(db_path=store) == []
+
+
+def test_verification_reads_a_different_target_as_uncontained(store):
+    """Containing one target must never verify a different one."""
+
+    record_action(
+        ACTION_BLOCK_IP, "185.123.45.67", "Suspicious.", db_path=store
+    )
+
+    assert ip_status("185.123.45.67", db_path=store)["blocked"] is True
+    assert ip_status("10.10.1.20", db_path=store)["blocked"] is False
+
+
+def test_verification_of_an_absent_store_is_negative_not_an_error(tmp_path):
+    """No containment store means nothing is contained -- not a crash.
+
+    The read-back runs on a fresh machine too, and a missing file has to
+    answer 'no' rather than raise: an exception here would surface to the
+    agent as an unavailable tool, which is not the same claim as 'this
+    action is not in force'.
+    """
+
+    absent = tmp_path / "never-created.db"
+
+    assert account_status("admin", db_path=absent)["contained"] is False
+    assert ip_status("185.123.45.67", db_path=absent)["blocked"] is False
+    assert not absent.exists()
+
+
+def test_the_status_tools_are_annotated_read_only():
+    """Verification must not itself require an approval gate."""
+
+    import server as sentinel_server
+
+    for tool in ("get_account_status", "get_ip_status"):
+        assert hasattr(sentinel_server, tool), f"{tool} is not exposed"
+
+    annotations = sentinel_server.READ_ONLY
+
+    assert annotations.read_only_hint is True
+    assert annotations.destructive_hint is False
+
+
+def test_get_ip_status_reports_the_containment_store(monkeypatch, store):
+    """The MCP verification tool reads the audit log, not a guess."""
+
+    import asyncio
+
+    import server as sentinel_server
+
+    monkeypatch.setattr(containment, "DB_PATH", store)
+
+    before = asyncio.run(sentinel_server.get_ip_status("185.123.45.67"))
+    assert before["blocked"] is False
+
+    record_action(
+        ACTION_BLOCK_IP, "185.123.45.67", "Suspicious.", db_path=store
+    )
+
+    after = asyncio.run(sentinel_server.get_ip_status("185.123.45.67"))
+    assert after["blocked"] is True
+    assert after["containment_actions"][0]["justification"] == "Suspicious."

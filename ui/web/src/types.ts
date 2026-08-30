@@ -63,6 +63,7 @@ export type RunEvent = Seq &
       }
     | {
         kind: "tool_call";
+        thread_id: string | null;
         tool_call_id: string | null;
         tool: string | null;
         arguments: Record<string, unknown>;
@@ -70,12 +71,26 @@ export type RunEvent = Seq &
       }
     | {
         kind: "tool_result";
+        thread_id: string | null;
         tool_call_id: string | null;
         tool: string | null;
         content: string | null;
         created_at?: string;
       }
-    | { kind: "agent_message"; content: string; created_at?: string }
+    | {
+        kind: "agent_message";
+        thread_id?: string | null;
+        content: string;
+        created_at?: string;
+      }
+    | {
+        kind: "thread_started";
+        thread_id: string;
+        name: string | null;
+        parent_thread_id: string | null;
+        created_at?: string;
+      }
+    | { kind: "thread_finished"; thread_id: string; created_at?: string }
     | ({ kind: "assessment" } & Assessment)
     | {
         kind: "approval_required";

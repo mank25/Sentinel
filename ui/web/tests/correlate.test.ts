@@ -18,6 +18,8 @@ import {
   initialState,
   reduce,
   reduceAll,
+  splitJustification,
+  threadLabel,
 } from "../src/correlate.ts";
 import type { RunEvent } from "../src/types.ts";
 
@@ -337,4 +339,246 @@ test("a second result cannot overwrite an already-answered call", () => {
   assert.deepEqual(state.items[0].tool?.facts, [
     { label: "contained", value: "false" },
   ]);
+});
+
+test("a result correlates on (thread_id, tool_call_id), not the id alone", () => {
+  reset();
+
+  const state = reduceAll(initialState(), [
+    ev({
+      kind: "tool_call",
+      thread_id: "main",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      arguments: { username: "admin" },
+    }),
+    ev({
+      kind: "tool_call",
+      thread_id: "subagent-abc",
+      tool_call_id: "call_123",
+      tool: "get_network_activity",
+      arguments: { ip_address: "185.123.45.67" },
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: "subagent-abc",
+      tool_call_id: "call_123",
+      tool: "get_network_activity",
+      content: '{"found": true, "ip_address": "185.123.45.67", "reputation": "suspicious"}',
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: "main",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      content: '{"found": true, "login_events": [1, 2, 3]}',
+    }),
+  ]);
+
+  // Two calls, two results, no extra rows: each result found its own call.
+  assert.equal(state.items.length, 2);
+
+  const [main, sub] = state.items;
+
+  assert.equal(main.tool?.threadId, "main");
+  assert.equal(main.tool?.tool, "get_login_history");
+  assert.deepEqual(
+    main.tool?.facts.find((f) => f.label === "events returned"),
+    { label: "events returned", value: "3" },
+  );
+
+  assert.equal(sub.tool?.threadId, "subagent-abc");
+  assert.equal(sub.tool?.tool, "get_network_activity");
+  assert.deepEqual(
+    sub.tool?.facts.find((f) => f.label === "reputation"),
+    { label: "reputation", value: "suspicious" },
+  );
+});
+
+test("a result from an unknown thread does not claim another thread's call", () => {
+  reset();
+
+  const state = reduceAll(initialState(), [
+    ev({
+      kind: "tool_call",
+      thread_id: "main",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      arguments: {},
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: "ghost",
+      tool_call_id: "call_123",
+      tool: "get_login_history",
+      content: '{"found": true, "login_events": []}',
+    }),
+  ]);
+
+  // The main call is still running; the orphan is shown on its own row.
+  assert.equal(state.items.length, 2);
+  assert.equal(state.items[0].tool?.status, "running");
+  assert.equal(state.items[1].tool?.threadId, "ghost");
+});
+
+test("events without a thread_id are treated as the main thread", () => {
+  reset();
+
+  const state = reduceAll(initialState(), [
+    ev({
+      kind: "tool_call",
+      thread_id: null,
+      tool_call_id: "c1",
+      tool: "get_login_history",
+      arguments: {},
+    }),
+    ev({
+      kind: "tool_result",
+      thread_id: null,
+      tool_call_id: "c1",
+      tool: "get_login_history",
+      content: '{"found": true, "login_events": []}',
+    }),
+  ]);
+
+  assert.equal(state.items.length, 1);
+  assert.equal(state.items[0].tool?.threadId, "main");
+  assert.equal(state.items[0].tool?.status, "done");
+});
+
+// ------------------------------------------------------------------
+// Thread lanes
+//
+// A delegated investigation puts each specialist on its own TrueForge
+// thread. These hold that the console attributes work to the thread that
+// did it, and that a linear run is unaffected.
+// ------------------------------------------------------------------
+
+test("a linear run has no threads to label", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "tool_call", thread_id: "main", tool_call_id: "call_1",
+      tool: "get_login_history", arguments: { username: "admin" } },
+  ] as RunEvent[]);
+
+  assert.equal(state.threads.length, 0);
+  assert.equal(threadLabel(state.threads, "main"), null);
+  assert.equal(threadLabel(state.threads, undefined), null);
+});
+
+test("a started specialist is recorded and named", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "aeea3c28-97f0",
+      name: "Identity Analyst", parent_thread_id: "main" },
+  ] as RunEvent[]);
+
+  assert.equal(state.threads.length, 1);
+  assert.equal(state.threads[0].name, "Identity Analyst");
+  assert.equal(state.threads[0].running, true);
+  assert.equal(threadLabel(state.threads, "aeea3c28-97f0"), "Identity Analyst");
+});
+
+test("an unnamed thread falls back to its id, never an invented role", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "b1c2d3e4f5a6",
+      name: null, parent_thread_id: "main" },
+  ] as RunEvent[]);
+
+  assert.equal(threadLabel(state.threads, "b1c2d3e4f5a6"), "thread b1c2d3e4");
+});
+
+test("a finished specialist stops being marked running", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "t1", name: "Network Analyst",
+      parent_thread_id: "main" },
+    { seq: 2, kind: "thread_finished", thread_id: "t1" },
+  ] as RunEvent[]);
+
+  assert.equal(state.threads[0].running, false);
+});
+
+test("a replayed thread_started does not duplicate the thread", () => {
+  const events = [
+    { seq: 1, kind: "thread_started", thread_id: "t1", name: "Identity Analyst",
+      parent_thread_id: "main" },
+  ] as RunEvent[];
+
+  // Replay from scratch, the way a reconnecting browser does.
+  const once = reduceAll(initialState(), events);
+  const twice = reduceAll(initialState(), [...events, ...events]);
+
+  assert.equal(once.threads.length, 1);
+  assert.equal(twice.threads.length, 1);
+});
+
+test("tool activity carries the thread that made the call", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "t1", name: "Network Analyst",
+      parent_thread_id: "main" },
+    { seq: 2, kind: "tool_call", thread_id: "t1", tool_call_id: "call_9",
+      tool: "get_network_activity", arguments: {} },
+  ] as RunEvent[]);
+
+  const call = state.items.find((item) => item.tool);
+
+  assert.equal(call?.threadId, "t1");
+  assert.equal(threadLabel(state.threads, call?.threadId), "Network Analyst");
+});
+
+// ------------------------------------------------------------------
+// The approval card's fields
+// ------------------------------------------------------------------
+
+test("the justification is separated from the target, and never truncated", () => {
+  const why =
+    "IP 185.123.45.67 produced 47 failed authentication attempts followed " +
+    "by a success at 2026-08-26T02:24:18 from an unknown device.";
+
+  const { target, why: reason } = splitJustification({
+    ip_address: "185.123.45.67",
+    justification: why,
+  });
+
+  assert.equal(target, "ip_address=185.123.45.67");
+  assert.equal(reason, why);
+});
+
+test("a missing justification yields an empty reason, not a filled-in one", () => {
+  const { target, why } = splitJustification({ username: "admin" });
+
+  assert.equal(target, "username=admin");
+  assert.equal(why, "");
+});
+
+// ------------------------------------------------------------------
+// Qodo #7-1: a non-string tool result must not reach React as a child
+// ------------------------------------------------------------------
+
+test("MCP content blocks are unwrapped into facts, not dropped", () => {
+  const blocks = [
+    { type: "text", text: JSON.stringify({ found: true, blocked: true }) },
+  ];
+
+  const facts = describeResult("get_ip_status", blocks as unknown);
+
+  assert.deepEqual(facts, [{ label: "blocked", value: "true" }]);
+});
+
+test("a tool result that is neither a string nor blocks yields no facts", () => {
+  assert.deepEqual(describeResult("get_ip_status", 42 as unknown), []);
+  assert.deepEqual(describeResult("get_ip_status", null), []);
+});
+
+test("content blocks still correlate to their call", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "tool_call", thread_id: "main", tool_call_id: "c1",
+      tool: "get_ip_status", arguments: {} },
+    { seq: 2, kind: "tool_result", thread_id: "main", tool_call_id: "c1",
+      tool: "get_ip_status",
+      content: [{ type: "text", text: '{"found":true,"blocked":true}' }] },
+  ] as unknown as RunEvent[]);
+
+  const call = state.items.find((item) => item.tool)?.tool;
+
+  assert.equal(call?.status, "done");
+  assert.deepEqual(call?.facts, [{ label: "blocked", value: "true" }]);
 });
