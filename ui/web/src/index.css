@@ -579,3 +579,268 @@ button:not(:disabled):hover { filter: brightness(1.14); }
 
 .narrative { min-width: 0; }
 .narrative .body.dim { color: var(--dim); }
+
+/* ---------- incident band ----------
+   Subject, the engine's verdict, and where the run has got to. Present from
+   the first event so the score is on screen when the approval decision is
+   made, not after it. */
+
+.incident {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px 32px;
+  align-items: center;
+  padding: 18px 22px;
+  margin: 18px 0 4px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.incident-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.incident-name {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.incident-threads {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.incident-risk { text-align: right; }
+
+.incident-score {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.incident-value {
+  font-family: var(--mono);
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.incident-max { color: var(--dim); font-size: 13px; }
+
+.incident-pending {
+  color: var(--dim);
+  font-size: 13px;
+  font-style: italic;
+}
+
+.incident-stages {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin: 0;
+  padding: 12px 0 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.incident-stages li {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.incident-stages li.reached {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: rgba(61, 220, 151, 0.06);
+}
+
+.incident-stages li + li::before {
+  content: "";
+}
+
+/* ---------- thread lanes ----------
+   Only rendered for a delegated run. A linear investigation has one thread
+   and shows no lane at all. */
+
+.event.delegated .event-body {
+  border-left: 2px solid var(--info);
+  padding-left: 12px;
+  margin-left: -2px;
+}
+
+.lane {
+  display: inline-block;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--info);
+  margin-bottom: 4px;
+}
+
+/* ---------- approval gate ----------
+   The screen this project exists to show a human. */
+
+.gate-head-note {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--muted);
+}
+
+.gate-action {
+  padding: 4px 0 0;
+  border-top: 1px solid var(--danger-dim);
+  margin-top: 14px;
+}
+
+.gate-action:first-of-type { border-top: 0; margin-top: 0; }
+
+.gate-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px 24px;
+  margin: 14px 0;
+}
+
+.gate-field.wide { grid-column: 1 / -1; }
+
+.gate-field dt {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+
+.gate-field dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.gate-field.wide dd { display: block; line-height: 1.6; }
+
+.gate-target {
+  color: var(--warn);
+  font-size: 14px;
+}
+
+.gate-lane,
+.gate-provenance {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.gate-score {
+  font-family: var(--mono);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.gate-evidence {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.gate-evidence summary {
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.gate-evidence ul {
+  margin: 10px 0 2px;
+  padding-left: 18px;
+}
+
+.gate-evidence li { margin-bottom: 5px; }
+
+.gate-evidence .factor-name {
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.gate-evidence .factor-reason { color: var(--muted); }
+
+.gate-warning {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--danger);
+  letter-spacing: 0.02em;
+}
+
+/* ---------- containment outcome ---------- */
+
+.outcomes {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.outcome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 12px;
+  margin-top: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+
+.outcome.allowed {
+  border-color: var(--accent-dim);
+  background: rgba(61, 220, 151, 0.06);
+}
+
+.outcome.denied {
+  border-color: var(--danger-dim);
+  background: rgba(255, 92, 92, 0.06);
+}
+
+.outcome-verdict {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.outcome.allowed .outcome-verdict { color: var(--accent); }
+.outcome.denied .outcome-verdict { color: var(--danger); }
+
+.outcome-call { font-size: 12px; color: var(--text); }
+.outcome-reason { font-size: 12px; color: var(--muted); }
+
+.outcome-note {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+@media (max-width: 720px) {
+  .incident { grid-template-columns: 1fr; }
+  .incident-risk { text-align: left; }
+  .incident-score { justify-content: flex-start; }
+}

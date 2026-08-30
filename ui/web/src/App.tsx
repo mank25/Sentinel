@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { followRun, sendDecision, startInvestigation } from "./api";
 import { initialState, reduce, type ConsoleState } from "./correlate";
 import { ApprovalGate } from "./components/ApprovalGate";
+import { IncidentHeader } from "./components/IncidentHeader";
 import { Timeline } from "./components/Timeline";
 import { Verdict } from "./components/Verdict";
 import type { Link, RunEvent, Status } from "./types";
@@ -154,12 +155,23 @@ export default function App() {
           </div>
         )}
 
-        <Timeline items={state.items} />
+        {state.status !== "idle" && (
+          <IncidentHeader
+            username={username}
+            assessment={state.assessment}
+            status={state.status}
+            threads={state.threads}
+          />
+        )}
+
+        <Timeline items={state.items} threads={state.threads} />
 
         {state.pending.length > 0 && (
           <ApprovalGate
             pending={state.pending}
             gateId={state.gateId}
+            assessment={state.assessment}
+            threads={state.threads}
             onDecide={decide}
             busy={deciding}
           />

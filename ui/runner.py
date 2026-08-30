@@ -245,7 +245,29 @@ class InvestigationRun:
             elif step == "model.message":
                 self.emit(
                     "agent_message",
+                    thread_id=entry.get("thread_id"),
                     content=entry.get("content"),
+                    created_at=entry.get("created_at"),
+                )
+
+            # Delegated investigations only. TrueForge records a thread per
+            # subagent; publishing the lifecycle is what lets the console
+            # show which specialist made which call instead of one
+            # undifferentiated stream. Absent in a linear run, so the
+            # console renders exactly as before.
+            elif step == "thread.created":
+                self.emit(
+                    "thread_started",
+                    thread_id=entry.get("thread_id"),
+                    name=entry.get("name"),
+                    parent_thread_id=entry.get("parent_thread_id"),
+                    created_at=entry.get("created_at"),
+                )
+
+            elif step == "thread.done":
+                self.emit(
+                    "thread_finished",
+                    thread_id=entry.get("thread_id"),
                     created_at=entry.get("created_at"),
                 )
 

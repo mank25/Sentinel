@@ -77,7 +77,20 @@ export type RunEvent = Seq &
         content: string | null;
         created_at?: string;
       }
-    | { kind: "agent_message"; content: string; created_at?: string }
+    | {
+        kind: "agent_message";
+        thread_id?: string | null;
+        content: string;
+        created_at?: string;
+      }
+    | {
+        kind: "thread_started";
+        thread_id: string;
+        name: string | null;
+        parent_thread_id: string | null;
+        created_at?: string;
+      }
+    | { kind: "thread_finished"; thread_id: string; created_at?: string }
     | ({ kind: "assessment" } & Assessment)
     | {
         kind: "approval_required";

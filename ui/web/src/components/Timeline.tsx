@@ -1,5 +1,5 @@
-import type { TimelineItem, ToolActivity } from "../correlate";
-import { formatArguments } from "../correlate";
+import type { ThreadInfo, TimelineItem, ToolActivity } from "../correlate";
+import { formatArguments, threadLabel } from "../correlate";
 import { ApprovalRecordCard } from "./ApprovalRecordCard";
 
 const ICON: Record<TimelineItem["kind"], string> = {
@@ -57,16 +57,31 @@ function truncate(text: string): string {
   return text.length > 1200 ? `${text.slice(0, 1200)}…` : text;
 }
 
-export function Timeline({ items }: { items: TimelineItem[] }) {
+export function Timeline({
+  items,
+  threads = [],
+}: {
+  items: TimelineItem[];
+  threads?: ThreadInfo[];
+}) {
   return (
     <div className="timeline">
-      {items.map((item) => (
+      {items.map((item) => {
+        // Only labelled when the entry did not come from the root agent, so
+        // a linear investigation stays uncluttered and a delegated one
+        // attributes every call to the specialist that made it.
+        const lane = threadLabel(threads, item.threadId);
+
+        return (
         <article
-          className={`event ${item.kind === "error" ? "err" : item.kind}`}
+          className={`event ${item.kind === "error" ? "err" : item.kind}${
+            lane ? " delegated" : ""
+          }`}
           key={item.id}
         >
           <div className="icon">{ICON[item.kind]}</div>
           <div className="event-body">
+            {lane && <div className="lane">{lane}</div>}
             {item.approval ? (
               <ApprovalRecordCard record={item.approval} />
             ) : (
@@ -79,7 +94,8 @@ export function Timeline({ items }: { items: TimelineItem[] }) {
             )}
           </div>
         </article>
-      ))}
+        );
+      })}
     </div>
   );
 }

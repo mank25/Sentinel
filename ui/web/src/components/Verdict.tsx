@@ -1,3 +1,4 @@
+import { splitJustification } from "../correlate";
 import type { Approval, Assessment } from "../types";
 
 interface Props {
@@ -87,17 +88,44 @@ export function Verdict({
         </div>
       </div>
 
-      {approvals.map((approval, index) => (
-        <div
-          className={`outcome ${approval.allowed ? "allowed" : "denied"}`}
-          key={index}
-        >
-          {approval.allowed ? "EXECUTED" : "BLOCKED BY OPERATOR"}
-          {"  "}
-          {approval.tool}
-          {approval.reason ? `  — ${approval.reason}` : ""}
+      {approvals.length > 0 && (
+        <div className="outcomes">
+          <div className="engine-label">Containment outcome</div>
+
+          {approvals.map((approval, index) => {
+            const { target } = splitJustification(approval.arguments);
+
+            return (
+              <div
+                className={`outcome ${approval.allowed ? "allowed" : "denied"}`}
+                key={index}
+              >
+                <span className="outcome-verdict">
+                  {approval.allowed
+                    ? "APPROVED — executed"
+                    : "DENIED — not executed"}
+                </span>
+                <code className="outcome-call">
+                  {approval.tool}
+                  {target ? `(${target})` : ""}
+                </code>
+                {approval.reason && (
+                  <span className="outcome-reason">{approval.reason}</span>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Whether the action took effect is a claim only the read-back
+              can support, and the agent makes it in its own report. The
+              console shows the human decision, which is the part it
+              actually witnessed. */}
+          <div className="outcome-note">
+            Verification of each executed action is read back from the
+            containment store by the agent — see CONTAINMENT in the report.
+          </div>
         </div>
-      ))}
+      )}
     </section>
   );
 }

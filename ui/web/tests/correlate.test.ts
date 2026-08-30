@@ -18,6 +18,8 @@ import {
   initialState,
   reduce,
   reduceAll,
+  splitJustification,
+  threadLabel,
 } from "../src/correlate.ts";
 import type { RunEvent } from "../src/types.ts";
 
@@ -442,4 +444,107 @@ test("events without a thread_id are treated as the main thread", () => {
   assert.equal(state.items.length, 1);
   assert.equal(state.items[0].tool?.threadId, "main");
   assert.equal(state.items[0].tool?.status, "done");
+});
+
+// ------------------------------------------------------------------
+// Thread lanes
+//
+// A delegated investigation puts each specialist on its own TrueForge
+// thread. These hold that the console attributes work to the thread that
+// did it, and that a linear run is unaffected.
+// ------------------------------------------------------------------
+
+test("a linear run has no threads to label", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "tool_call", thread_id: "main", tool_call_id: "call_1",
+      tool: "get_login_history", arguments: { username: "admin" } },
+  ] as RunEvent[]);
+
+  assert.equal(state.threads.length, 0);
+  assert.equal(threadLabel(state.threads, "main"), null);
+  assert.equal(threadLabel(state.threads, undefined), null);
+});
+
+test("a started specialist is recorded and named", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "aeea3c28-97f0",
+      name: "Identity Analyst", parent_thread_id: "main" },
+  ] as RunEvent[]);
+
+  assert.equal(state.threads.length, 1);
+  assert.equal(state.threads[0].name, "Identity Analyst");
+  assert.equal(state.threads[0].running, true);
+  assert.equal(threadLabel(state.threads, "aeea3c28-97f0"), "Identity Analyst");
+});
+
+test("an unnamed thread falls back to its id, never an invented role", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "b1c2d3e4f5a6",
+      name: null, parent_thread_id: "main" },
+  ] as RunEvent[]);
+
+  assert.equal(threadLabel(state.threads, "b1c2d3e4f5a6"), "thread b1c2d3e4");
+});
+
+test("a finished specialist stops being marked running", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "t1", name: "Network Analyst",
+      parent_thread_id: "main" },
+    { seq: 2, kind: "thread_finished", thread_id: "t1" },
+  ] as RunEvent[]);
+
+  assert.equal(state.threads[0].running, false);
+});
+
+test("a replayed thread_started does not duplicate the thread", () => {
+  const events = [
+    { seq: 1, kind: "thread_started", thread_id: "t1", name: "Identity Analyst",
+      parent_thread_id: "main" },
+  ] as RunEvent[];
+
+  // Replay from scratch, the way a reconnecting browser does.
+  const once = reduceAll(initialState(), events);
+  const twice = reduceAll(initialState(), [...events, ...events]);
+
+  assert.equal(once.threads.length, 1);
+  assert.equal(twice.threads.length, 1);
+});
+
+test("tool activity carries the thread that made the call", () => {
+  const state = reduceAll(initialState(), [
+    { seq: 1, kind: "thread_started", thread_id: "t1", name: "Network Analyst",
+      parent_thread_id: "main" },
+    { seq: 2, kind: "tool_call", thread_id: "t1", tool_call_id: "call_9",
+      tool: "get_network_activity", arguments: {} },
+  ] as RunEvent[]);
+
+  const call = state.items.find((item) => item.tool);
+
+  assert.equal(call?.threadId, "t1");
+  assert.equal(threadLabel(state.threads, call?.threadId), "Network Analyst");
+});
+
+// ------------------------------------------------------------------
+// The approval card's fields
+// ------------------------------------------------------------------
+
+test("the justification is separated from the target, and never truncated", () => {
+  const why =
+    "IP 185.123.45.67 produced 47 failed authentication attempts followed " +
+    "by a success at 2026-08-26T02:24:18 from an unknown device.";
+
+  const { target, why: reason } = splitJustification({
+    ip_address: "185.123.45.67",
+    justification: why,
+  });
+
+  assert.equal(target, "ip_address=185.123.45.67");
+  assert.equal(reason, why);
+});
+
+test("a missing justification yields an empty reason, not a filled-in one", () => {
+  const { target, why } = splitJustification({ username: "admin" });
+
+  assert.equal(target, "username=admin");
+  assert.equal(why, "");
 });
